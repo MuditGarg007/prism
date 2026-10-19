@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -94,5 +95,50 @@ func (r *Rate) UnmarshalYAML(n *yaml.Node) error {
 		return fmt.Errorf("line %d: %w", n.Line, err)
 	}
 	*r = v
+	return nil
+}
+
+// Prefix is an IP network written as a CIDR ("10.0.0.0/8") or a bare
+// address ("127.0.0.1"), which means a single host.
+type Prefix struct {
+	netip.Prefix
+}
+
+// ParsePrefix parses a CIDR or a bare address. Host bits are masked off, and
+// IPv4-mapped IPv6 prefixes become IPv4 so they match unmapped peer
+// addresses.
+func ParsePrefix(s string) (netip.Prefix, error) {
+	s = strings.TrimSpace(s)
+	var p netip.Prefix
+	if strings.Contains(s, "/") {
+		var err error
+		if p, err = netip.ParsePrefix(s); err != nil {
+			return netip.Prefix{}, fmt.Errorf("invalid CIDR %q", s)
+		}
+	} else {
+		a, err := netip.ParseAddr(s)
+		if err != nil || a.Zone() != "" {
+			return netip.Prefix{}, fmt.Errorf("invalid IP or CIDR %q", s)
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	if a := p.Addr(); a.Is4In6() {
+		if p.Bits() < 96 {
+			return netip.Prefix{}, fmt.Errorf("invalid CIDR %q: IPv4-mapped prefix shorter than /96", s)
+		}
+		p = netip.PrefixFrom(a.Unmap(), p.Bits()-96)
+	}
+	return p.Masked(), nil
+}
+
+func (p *Prefix) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.ScalarNode {
+		return fmt.Errorf("line %d: CIDR must be a scalar", n.Line)
+	}
+	v, err := ParsePrefix(n.Value)
+	if err != nil {
+		return fmt.Errorf("line %d: %w", n.Line, err)
+	}
+	p.Prefix = v
 	return nil
 }

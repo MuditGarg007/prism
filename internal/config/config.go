@@ -3,14 +3,27 @@ package config
 import "time"
 
 type Config struct {
-	Listeners []Listener           `yaml:"listeners"`
-	Upstreams map[string]*Upstream `yaml:"upstreams"`
-	Routes    []Route              `yaml:"routes"`
+	// TrustedProxies lists the peers whose X-Forwarded-* headers are kept.
+	// Headers from any other peer are replaced.
+	TrustedProxies []Prefix `yaml:"trusted_proxies"`
+	// ForwardedHeader also sends an RFC 7239 Forwarded header upstream.
+	ForwardedHeader bool                 `yaml:"forwarded_header"`
+	Listeners       []Listener           `yaml:"listeners"`
+	Upstreams       map[string]*Upstream `yaml:"upstreams"`
+	Routes          []Route              `yaml:"routes"`
 }
 
 type Listener struct {
-	Addr string       `yaml:"addr"`
-	TLS  *ListenerTLS `yaml:"tls"`
+	Addr     string           `yaml:"addr"`
+	TLS      *ListenerTLS     `yaml:"tls"`
+	Timeouts ListenerTimeouts `yaml:"timeouts"`
+}
+
+// ListenerTimeouts has no read or write timeout for the whole request,
+// because either one would cut off long uploads and streaming responses.
+type ListenerTimeouts struct {
+	ReadHeader time.Duration `yaml:"read_header"`
+	Idle       time.Duration `yaml:"idle"` // keep-alive wait between requests
 }
 
 type ListenerTLS struct {
@@ -35,6 +48,9 @@ type Upstream struct {
 	Health         *HealthCheck    `yaml:"health"`
 	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker"`
 	Timeouts       Timeouts        `yaml:"timeouts"`
+	// MaxIdleConnsPerHost caps idle keep-alive connections to each backend.
+	// Go's default of 2 forces new connections under any real concurrency.
+	MaxIdleConnsPerHost int `yaml:"max_idle_conns_per_host"`
 }
 
 type Backend struct {
@@ -65,12 +81,14 @@ type CircuitBreaker struct {
 type Timeouts struct {
 	Connect        time.Duration `yaml:"connect"`
 	ResponseHeader time.Duration `yaml:"response_header"`
+	IdleConn       time.Duration `yaml:"idle_conn"` // how long an idle backend connection is kept
 }
 
 type Route struct {
 	Match          Match      `yaml:"match"`
 	Upstream       string     `yaml:"upstream"`
 	StripPrefix    bool       `yaml:"strip_prefix"`
+	PreserveHost   bool       `yaml:"preserve_host"` // send the client's Host instead of the backend's
 	Headers        Headers    `yaml:"headers"`
 	RateLimit      *RateLimit `yaml:"rate_limit"`
 	MaxBody        ByteSize   `yaml:"max_body"` // 0 means no limit

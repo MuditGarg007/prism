@@ -42,6 +42,9 @@ func TestLoadExample(t *testing.T) {
 	if want := []string{"connect_error", "502", "503"}; !slices.Equal(r.Retry.On, want) {
 		t.Errorf("retry.on = %q, want %q", r.Retry.On, want)
 	}
+	if len(cfg.TrustedProxies) == 0 {
+		t.Error("trusted_proxies is empty")
+	}
 }
 
 func TestParseDefaults(t *testing.T) {
@@ -58,6 +61,19 @@ func TestParseDefaults(t *testing.T) {
 	}
 	if u.Timeouts.Connect != defaultConnectTimeout {
 		t.Errorf("connect timeout = %v, want %v", u.Timeouts.Connect, defaultConnectTimeout)
+	}
+	if u.Timeouts.IdleConn != defaultIdleConnTimeout {
+		t.Errorf("idle_conn timeout = %v, want %v", u.Timeouts.IdleConn, defaultIdleConnTimeout)
+	}
+	if u.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
+		t.Errorf("max_idle_conns_per_host = %d, want %d", u.MaxIdleConnsPerHost, defaultMaxIdleConnsPerHost)
+	}
+	lt := cfg.Listeners[0].Timeouts
+	if lt.ReadHeader != defaultReadHeaderTimeout || lt.Idle != defaultListenerIdleTimeout {
+		t.Errorf("listener timeouts = %+v, want read_header %v, idle %v", lt, defaultReadHeaderTimeout, defaultListenerIdleTimeout)
+	}
+	if cfg.TrustedProxies != nil || cfg.ForwardedHeader || cfg.Routes[0].PreserveHost {
+		t.Error("trusted_proxies, forwarded_header and preserve_host must default to off")
 	}
 }
 
@@ -85,6 +101,16 @@ func TestParseErrors(t *testing.T) {
 		{"bad size unit", `upstream: web }`, `upstream: web, max_body: 10XB }`, "unit must be B, KB, MB or GB"},
 		{"bad rate unit", `upstream: web }`, `upstream: web, rate_limit: { per_ip: "100/d" } }`, "unit must be s, m or h"},
 		{"bad retry condition", `upstream: web }`, `upstream: web, retry: { attempts: 1, on: [404] } }`, `retry.on[0]: unknown condition "404"`},
+		{"bad trusted proxy", "listeners:", "trusted_proxies: [10.0.0.0/8, 10.0.0.300]\nlisteners:", `line 2: invalid IP or CIDR "10.0.0.300"`},
+		{"trusted proxy bad bits", "listeners:", "trusted_proxies: [10.0.0.0/33]\nlisteners:", `invalid CIDR "10.0.0.0/33"`},
+		{"trusted proxy not a list", "listeners:", "trusted_proxies: 10.0.0.0/8\nlisteners:", "cannot unmarshal"},
+		{"negative read_header", `{ addr: ":8080" }`, `{ addr: ":8080", timeouts: { read_header: -1s } }`, "listeners[0].timeouts.read_header: must be positive"},
+		{"negative idle_conn", "    backends:", "    timeouts: { idle_conn: -1s }\n    backends:", "upstreams.web.timeouts.idle_conn: must be positive"},
+		{"bad header name", `upstream: web }`, `upstream: web, headers: { request_set: { "X Env": prod } } }`, `headers.request_set: invalid header name "X Env"`},
+		{"header value with newline", `upstream: web }`, `upstream: web, headers: { response_set: { X-A: "a\nb" } } }`, "headers.response_set.X-A: value must not contain CR, LF or NUL"},
+		{"hop-by-hop header rule", `upstream: web }`, `upstream: web, headers: { response_remove: [Connection] } }`, `response_remove[0]: "Connection" is a hop-by-hop header`},
+		{"remove host", `upstream: web }`, `upstream: web, headers: { request_remove: [host] } }`, "request_remove[0]: Host cannot be removed"},
+		{"negative max idle conns", "    backends:", "    max_idle_conns_per_host: -1\n    backends:", "upstreams.web.max_idle_conns_per_host: must be at least 1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -167,6 +193,40 @@ func TestParseRate(t *testing.T) {
 		got, err := ParseRate(tt.in)
 		if (err == nil) != tt.ok || got != tt.want {
 			t.Errorf("ParseRate(%q) = %+v, %v; want %+v, ok=%v", tt.in, got, err, tt.want, tt.ok)
+		}
+	}
+}
+
+func TestParsePrefix(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string // "" means an error
+	}{
+		{"10.0.0.0/8", "10.0.0.0/8"},
+		{"10.1.2.3/8", "10.0.0.0/8"},
+		{"127.0.0.1", "127.0.0.1/32"},
+		{" 192.168.0.0/16 ", "192.168.0.0/16"},
+		{"::1", "::1/128"},
+		{"2001:db8::/32", "2001:db8::/32"},
+		{"::ffff:10.0.0.0/104", "10.0.0.0/8"},
+		{"::ffff:10.0.0.1", "10.0.0.1/32"},
+		{"", ""},
+		{"10.0.0.0/33", ""},
+		{"10.0.0", ""},
+		{"fe80::1%eth0", ""},
+		{"::ffff:0.0.0.0/64", ""},
+		{"example.com", ""},
+	}
+	for _, tt := range tests {
+		got, err := ParsePrefix(tt.in)
+		if tt.want == "" {
+			if err == nil {
+				t.Errorf("ParsePrefix(%q) = %v, want error", tt.in, got)
+			}
+			continue
+		}
+		if err != nil || got.String() != tt.want {
+			t.Errorf("ParsePrefix(%q) = %v, %v; want %s", tt.in, got, err, tt.want)
 		}
 	}
 }

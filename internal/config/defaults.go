@@ -8,6 +8,10 @@ import (
 const (
 	defaultConnectTimeout        = 5 * time.Second
 	defaultResponseHeaderTimeout = 30 * time.Second
+	defaultIdleConnTimeout       = 90 * time.Second
+	defaultMaxIdleConnsPerHost   = 64
+	defaultReadHeaderTimeout     = 10 * time.Second
+	defaultListenerIdleTimeout   = 120 * time.Second
 	defaultHealthInterval        = 10 * time.Second
 	defaultHealthTimeout         = 2 * time.Second
 	defaultUnhealthyAfter        = 3
@@ -22,6 +26,11 @@ const (
 // applyDefaults fills zero values only, so invalid input such as a negative
 // weight is left for validate to report.
 func (c *Config) applyDefaults() {
+	for i := range c.Listeners {
+		t := &c.Listeners[i].Timeouts
+		setDefault(&t.ReadHeader, defaultReadHeaderTimeout)
+		setDefault(&t.Idle, defaultListenerIdleTimeout)
+	}
 	for _, u := range c.Upstreams {
 		if u == nil {
 			continue
@@ -32,6 +41,8 @@ func (c *Config) applyDefaults() {
 		}
 		setDefault(&u.Timeouts.Connect, defaultConnectTimeout)
 		setDefault(&u.Timeouts.ResponseHeader, defaultResponseHeaderTimeout)
+		setDefault(&u.Timeouts.IdleConn, defaultIdleConnTimeout)
+		setDefault(&u.MaxIdleConnsPerHost, defaultMaxIdleConnsPerHost)
 		if h := u.Health; h != nil {
 			setDefault(&h.Interval, defaultHealthInterval)
 			setDefault(&h.Timeout, defaultHealthTimeout)

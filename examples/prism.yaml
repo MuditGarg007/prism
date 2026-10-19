@@ -1,8 +1,14 @@
 # Example Prism config. Check it with:
 #   prism -config examples/prism.yaml -validate
 
+# Peers whose X-Forwarded-* headers are trusted (for example a load balancer
+# in front of Prism). From anyone else, those headers are replaced.
+trusted_proxies: ["10.0.0.0/8", "127.0.0.1"]
+forwarded_header: false           # also send an RFC 7239 Forwarded header
+
 listeners:
   - addr: ":8080"
+    timeouts: { read_header: 10s, idle: 120s }
   # TLS listener. Cert paths are relative to this file and must exist.
   # - addr: ":8443"
   #   tls: { certs: [{ cert: certs/a.pem, key: certs/a.key }] }
@@ -15,7 +21,8 @@ upstreams:
       - { url: "https://10.0.0.2:8443", weight: 1, tls: { server_name: api.internal } }
     health: { path: /healthz, interval: 5s, timeout: 1s, unhealthy_after: 3, healthy_after: 2 }
     circuit_breaker: { failure_ratio: 0.5, min_requests: 20, open_for: 30s }
-    timeouts: { connect: 2s, response_header: 10s }
+    timeouts: { connect: 2s, response_header: 10s, idle_conn: 90s }
+    max_idle_conns_per_host: 64
 
   static:
     backends:
@@ -34,3 +41,4 @@ routes:
 
   - match: { path_prefix: "/" }
     upstream: static
+    preserve_host: true           # send the client's Host header, not the backend's

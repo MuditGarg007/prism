@@ -57,6 +57,8 @@ func (c *Config) validateListeners(p *problems) {
 			p.add(path+".addr", "duplicate listener address %q", l.Addr)
 		}
 		seen[l.Addr] = true
+		checkPositive(p, path+".timeouts.read_header", l.Timeouts.ReadHeader)
+		checkPositive(p, path+".timeouts.idle", l.Timeouts.Idle)
 
 		if l.TLS == nil {
 			continue
@@ -102,6 +104,8 @@ func (c *Config) validateUpstreams(p *problems) {
 		}
 		checkPositive(p, path+".timeouts.connect", u.Timeouts.Connect)
 		checkPositive(p, path+".timeouts.response_header", u.Timeouts.ResponseHeader)
+		checkPositive(p, path+".timeouts.idle_conn", u.Timeouts.IdleConn)
+		checkMin(p, path+".max_idle_conns_per_host", u.MaxIdleConnsPerHost, 1)
 		if h := u.Health; h != nil {
 			validateHealth(p, path+".health", h)
 		}
@@ -191,6 +195,7 @@ func (c *Config) validateRoutes(p *problems) {
 				checkMin(p, path+".rate_limit.burst", rl.Burst, 1)
 			}
 		}
+		validateHeaders(p, path+".headers", r.Headers)
 		checkMin(p, path+".max_concurrency", r.MaxConcurrency, 0)
 		if rt := r.Retry; rt != nil {
 			validateRetry(p, path+".retry", rt)
@@ -219,6 +224,61 @@ func validateHost(h string) error {
 		}
 	}
 	return nil
+}
+
+// hopByHop headers are always removed by the proxy, so rules naming them
+// would silently do nothing.
+var hopByHop = []string{
+	"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+	"proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
+}
+
+func validateHeaders(p *problems, path string, h Headers) {
+	checkName := func(path, name string) {
+		switch {
+		case !isToken(name):
+			p.add(path, "invalid header name %q", name)
+		case slices.Contains(hopByHop, strings.ToLower(name)):
+			p.add(path, "%q is a hop-by-hop header, which is always removed", name)
+		}
+	}
+	checkSet := func(path string, set map[string]string) {
+		for _, name := range slices.Sorted(maps.Keys(set)) {
+			checkName(path, name)
+			if strings.ContainsAny(set[name], "\r\n\x00") {
+				p.add(path+"."+name, "value must not contain CR, LF or NUL")
+			}
+		}
+	}
+	checkRemove := func(path string, names []string) {
+		for i, name := range names {
+			checkName(fmt.Sprintf("%s[%d]", path, i), name)
+		}
+	}
+	checkSet(path+".request_set", h.RequestSet)
+	checkRemove(path+".request_remove", h.RequestRemove)
+	checkSet(path+".response_set", h.ResponseSet)
+	checkRemove(path+".response_remove", h.ResponseRemove)
+	for i, name := range h.RequestRemove {
+		if strings.EqualFold(name, "Host") {
+			p.add(fmt.Sprintf("%s.request_remove[%d]", path, i), "Host cannot be removed; set it with request_set or preserve_host")
+		}
+	}
+}
+
+// isToken reports whether s is an RFC 9110 token, the syntax of a header
+// name.
+func isToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r >= 0x7f || !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			strings.ContainsRune("!#$%&'*+-.^_`|~", r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateRetry(p *problems, path string, rt *Retry) {
