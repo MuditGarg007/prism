@@ -75,14 +75,17 @@ func TestBuildExample(t *testing.T) {
 	}
 	out := logs.String()
 	for _, want := range []string{
-		"balancer=least_conn",
 		"option=upstreams.api.health",
 		"option=upstreams.api.circuit_breaker",
-		"option=routes[0].max_body",
-		"option=routes[0].rate_limit",
+		"option=routes[0].cache",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("warnings %q do not mention %s", out, want)
+		}
+	}
+	for _, done := range []string{"rate_limit", "max_body", "max_concurrency", "retry"} {
+		if strings.Contains(out, done) {
+			t.Errorf("warned about %s, which is implemented: %q", done, out)
 		}
 	}
 	if strings.Contains(out, "routes[1]") || strings.Contains(out, "upstreams.static") {

@@ -18,14 +18,18 @@ import (
 	"github.com/MuditGarg007/prism/internal/config"
 )
 
-// firstBalancer always picks the first backend.
-type firstBalancer struct{}
+// firstBalancer always picks the first usable backend.
+type firstBalancer []*Backend
 
-func (firstBalancer) Pick(_ *http.Request, bs []*Backend) (*Backend, error) {
-	if len(bs) == 0 {
-		return nil, ErrNoBackend
+func newFirst(bs []*Backend) Balancer { return firstBalancer(bs) }
+
+func (fb firstBalancer) Pick(c Choice) (*Backend, error) {
+	for _, b := range fb {
+		if c.Usable(b) {
+			return b, nil
+		}
 	}
-	return bs[0], nil
+	return nil, ErrNoBackend
 }
 
 func testUpstream(backends ...config.Backend) *config.Upstream {
@@ -45,7 +49,7 @@ func TestNewPool(t *testing.T) {
 		config.Backend{URL: "http://127.0.0.1:9000", Weight: 3},
 		config.Backend{URL: "https://10.0.0.2:8443", Weight: 1},
 	)
-	p, err := NewPool("api", u, firstBalancer{})
+	p, err := NewPool("api", u, newFirst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,8 +86,11 @@ func TestNewPool(t *testing.T) {
 		t.Errorf("https backend TLS config = %+v, want MinVersion TLS 1.2", c)
 	}
 
-	if b, err := p.Pick(httptest.NewRequest("GET", "/", nil)); err != nil || b != plain {
+	if b, err := p.Pick(Choice{}); err != nil || b != plain {
 		t.Errorf("Pick = %v, %v; want backend 0", b, err)
+	}
+	if b, err := p.Pick(Choice{Tried: []*Backend{plain}}); err != nil || b != secure {
+		t.Errorf("Pick after trying backend 0 = %v, %v; want backend 1", b, err)
 	}
 }
 
@@ -121,6 +128,25 @@ func TestBackendHealth(t *testing.T) {
 // TestBackendTLS checks certificate verification against a custom CA and the
 // name sent in SNI. httptest's certificate is valid for 127.0.0.1 and
 // example.com.
+func TestChoiceUsable(t *testing.T) {
+	up, down, tried := &Backend{}, &Backend{}, &Backend{}
+	down.SetHealthy(false)
+	c := Choice{Tried: []*Backend{tried}}
+	for _, tt := range []struct {
+		name string
+		b    *Backend
+		want bool
+	}{
+		{"available", up, true},
+		{"unhealthy", down, false},
+		{"already tried", tried, false},
+	} {
+		if got := c.Usable(tt.b); got != tt.want {
+			t.Errorf("%s: Usable = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestBackendTLS(t *testing.T) {
 	sni := make(chan string, 1)
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -152,7 +178,7 @@ func TestBackendTLS(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := NewPool("tls", testUpstream(config.Backend{URL: srv.URL, Weight: 1, TLS: tt.tls}), firstBalancer{})
+			p, err := NewPool("tls", testUpstream(config.Backend{URL: srv.URL, Weight: 1, TLS: tt.tls}), newFirst)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -204,7 +230,7 @@ func TestBadCAFile(t *testing.T) {
 				config.Backend{URL: "http://127.0.0.1:9000", Weight: 1},
 				config.Backend{URL: "https://127.0.0.1:9443", Weight: 1, TLS: &config.BackendTLS{CAFile: tt.file}},
 			)
-			_, err := NewPool("api", u, firstBalancer{})
+			_, err := NewPool("api", u, newFirst)
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("got %v, want %v", err, tt.want)
 			}

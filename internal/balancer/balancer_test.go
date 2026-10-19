@@ -2,7 +2,6 @@ package balancer
 
 import (
 	"errors"
-	"net/http/httptest"
 	"sync"
 	"testing"
 
@@ -28,10 +27,9 @@ func indexOf(bs []*upstream.Backend, b *upstream.Backend) int {
 
 func TestRoundRobinOrder(t *testing.T) {
 	bs := backends(3)
-	rr := &RoundRobin{}
-	req := httptest.NewRequest("GET", "/", nil)
+	rr := NewRoundRobin(bs)
 	for i := range 7 {
-		b, err := rr.Pick(req, bs)
+		b, err := rr.Pick(upstream.Choice{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -44,10 +42,9 @@ func TestRoundRobinOrder(t *testing.T) {
 func TestRoundRobinSkipsUnavailable(t *testing.T) {
 	bs := backends(3)
 	bs[1].SetHealthy(false)
-	rr := &RoundRobin{}
-	req := httptest.NewRequest("GET", "/", nil)
+	rr := NewRoundRobin(bs)
 	for range 9 {
-		b, err := rr.Pick(req, bs)
+		b, err := rr.Pick(upstream.Choice{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -62,10 +59,33 @@ func TestRoundRobinNoBackend(t *testing.T) {
 	for _, b := range down {
 		b.SetHealthy(false)
 	}
-	req := httptest.NewRequest("GET", "/", nil)
-	for name, bs := range map[string][]*upstream.Backend{"empty": nil, "all down": down} {
-		if _, err := (&RoundRobin{}).Pick(req, bs); !errors.Is(err, upstream.ErrNoBackend) {
-			t.Errorf("%s: got %v, want ErrNoBackend", name, err)
+	all := backends(2)
+	for _, tt := range []struct {
+		name string
+		bs   []*upstream.Backend
+		c    upstream.Choice
+	}{
+		{"empty", nil, upstream.Choice{}},
+		{"all down", down, upstream.Choice{}},
+		{"all tried", all, upstream.Choice{Tried: all}},
+	} {
+		if _, err := NewRoundRobin(tt.bs).Pick(tt.c); !errors.Is(err, upstream.ErrNoBackend) {
+			t.Errorf("%s: got %v, want ErrNoBackend", tt.name, err)
+		}
+	}
+}
+
+func TestRoundRobinSkipsTried(t *testing.T) {
+	bs := backends(3)
+	rr := NewRoundRobin(bs)
+	c := upstream.Choice{Tried: bs[:1]}
+	for range 9 {
+		b, err := rr.Pick(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b == bs[0] {
+			t.Fatal("picked a backend the request already tried")
 		}
 	}
 }
@@ -75,14 +95,13 @@ func TestRoundRobinNoBackend(t *testing.T) {
 func TestRoundRobinConcurrent(t *testing.T) {
 	const goroutines, picks = 8, 3000
 	bs := backends(3)
-	rr := &RoundRobin{}
+	rr := NewRoundRobin(bs)
 	counts := make([][3]int, goroutines)
 	var wg sync.WaitGroup
 	for g := range goroutines {
 		wg.Go(func() {
-			req := httptest.NewRequest("GET", "/", nil)
 			for range picks {
-				b, err := rr.Pick(req, bs)
+				b, err := rr.Pick(upstream.Choice{})
 				if err != nil {
 					t.Error(err)
 					return
@@ -107,13 +126,11 @@ func TestRoundRobinConcurrent(t *testing.T) {
 }
 
 func BenchmarkRoundRobin(b *testing.B) {
-	bs := backends(8)
-	rr := &RoundRobin{}
-	req := httptest.NewRequest("GET", "/", nil)
+	rr := NewRoundRobin(backends(8))
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			rr.Pick(req, bs)
+			rr.Pick(upstream.Choice{})
 		}
 	})
 }

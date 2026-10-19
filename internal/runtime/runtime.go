@@ -14,7 +14,10 @@ import (
 
 	"github.com/MuditGarg007/prism/internal/balancer"
 	"github.com/MuditGarg007/prism/internal/config"
+	"github.com/MuditGarg007/prism/internal/limits"
 	"github.com/MuditGarg007/prism/internal/proxy"
+	"github.com/MuditGarg007/prism/internal/ratelimit"
+	"github.com/MuditGarg007/prism/internal/resilience"
 	"github.com/MuditGarg007/prism/internal/router"
 	"github.com/MuditGarg007/prism/internal/upstream"
 )
@@ -36,10 +39,6 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 	// Sorted, so warnings and errors come out in the same order every time.
 	for _, name := range slices.Sorted(maps.Keys(cfg.Upstreams)) {
 		u := cfg.Upstreams[name]
-		if !balancer.Implemented(u.Balancer) {
-			log.Warn("balancer is not implemented yet, using round_robin",
-				"upstream", name, "balancer", u.Balancer)
-		}
 		warnIgnored(log, "upstreams."+name, map[string]bool{
 			"health":          u.Health != nil,
 			"circuit_breaker": u.CircuitBreaker != nil,
@@ -60,13 +59,27 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 			return nil, fmt.Errorf("routes[%d]: unknown upstream %q", i, r.Upstream)
 		}
 		warnIgnored(log, fmt.Sprintf("routes[%d]", i), map[string]bool{
-			"rate_limit":      r.RateLimit != nil,
-			"max_body":        r.MaxBody != 0,
-			"max_concurrency": r.MaxConcurrency != 0,
-			"retry":           r.Retry != nil,
-			"cache":           r.Cache != nil,
+			"cache": r.Cache != nil,
 		})
 		h := r.Headers
+		var limiter *ratelimit.Limiter
+		if rl := r.RateLimit; rl != nil {
+			limiter = ratelimit.New(rl.PerIP.Count, rl.PerIP.Per, rl.Burst)
+		}
+		// budget_ratio is accepted but has no effect until M3 adds the
+		// retry budget.
+		var retry *resilience.Retry
+		if rc := r.Retry; rc != nil && rc.Attempts > 0 {
+			var err error
+			if retry, err = resilience.NewRetry(rc.Attempts, rc.On); err != nil {
+				rt.Close()
+				return nil, fmt.Errorf("routes[%d].retry: %w", i, err)
+			}
+		}
+		var sem *limits.Semaphore
+		if r.MaxConcurrency > 0 {
+			sem = limits.NewSemaphore(r.MaxConcurrency)
+		}
 		entries = append(entries, router.Entry[*proxy.Route]{
 			Host:       r.Match.Host,
 			PathPrefix: r.Match.PathPrefix,
@@ -78,6 +91,10 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 				PreserveHost: r.PreserveHost,
 				Request:      proxy.NewHeaderOps(h.RequestSet, h.RequestRemove),
 				Response:     proxy.NewHeaderOps(h.ResponseSet, h.ResponseRemove),
+				RateLimit:    limiter,
+				MaxBody:      int64(r.MaxBody),
+				Concurrency:  sem,
+				Retry:        retry,
 			},
 		})
 	}
@@ -96,7 +113,7 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 }
 
 // warnIgnored warns about each config feature in set that is present but not
-// implemented yet, so that a limit such as max_body is never silently
+// implemented yet, so that a feature such as a cache is never silently
 // unenforced.
 func warnIgnored(log *slog.Logger, path string, set map[string]bool) {
 	for _, name := range slices.Sorted(maps.Keys(set)) {

@@ -89,7 +89,7 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 		attrs = append(attrs, slog.String("route", an.Route.Name), slog.String("upstream", an.Route.Pool.Name))
 	}
 	if an.Backend != nil {
-		attrs = append(attrs, slog.String("backend", an.Backend.String()))
+		attrs = append(attrs, slog.String("backend", an.Backend.String()), slog.Int("attempts", an.Attempts))
 	}
 	if an.Error != "" {
 		attrs = append(attrs, slog.String("error", an.Error))

@@ -230,7 +230,7 @@ routes:
 		"method=GET", "host=api.test", "path=/v1/users ", "proto=HTTP/1.1",
 		"status=201", "bytes=5", "duration=",
 		"client=203.0.113.9", // the peer is trusted, so its X-Forwarded-For is used
-		"route=api.test/v1/", "upstream=api", "backend=" + backend.URL,
+		"route=api.test/v1/", "upstream=api", "backend=" + backend.URL, "attempts=1",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("access log %q lacks %q", out, want)

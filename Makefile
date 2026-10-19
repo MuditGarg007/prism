@@ -28,6 +28,7 @@ fuzz:
 	go test -run='^$$' -fuzz=FuzzMatch -fuzztime=30s ./internal/router
 	go test -run='^$$' -fuzz=FuzzClientIP -fuzztime=30s ./internal/proxy
 	go test -run='^$$' -fuzz=FuzzValidPath -fuzztime=30s ./internal/proxy
+	go test -run='^$$' -fuzz=FuzzGCRA -fuzztime=30s ./internal/ratelimit
 
 validate: build
 	./bin/prism -config examples/prism.yaml -validate

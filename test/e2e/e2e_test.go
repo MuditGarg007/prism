@@ -1,6 +1,6 @@
 // Package e2e runs the whole proxy, from YAML config to listening server,
-// against real backends over loopback. These tests are the M1 exit criteria,
-// and each one asserts on what the backend saw.
+// against real backends over loopback. These tests are the M1 and M2 (in
+// m2_test.go) exit criteria, and each one asserts on what the backend saw.
 package e2e
 
 import (
@@ -29,13 +29,19 @@ import (
 // is shut down when the test ends, before backends registered earlier.
 func startProxy(t *testing.T, backend, extra string) string {
 	t.Helper()
-	yaml := fmt.Sprintf(`%s
-listeners: [{ addr: "127.0.0.1:0" }]
+	return startProxyYAML(t, fmt.Sprintf(`%s
 upstreams:
   app: { backends: [{ url: %q }] }
 routes:
   - { match: { path_prefix: / }, upstream: app }
-`, extra, backend)
+`, extra, backend))
+}
+
+// startProxyYAML runs prism from body, a config with everything but the
+// listeners, and returns its base URL. It is shut down like startProxy's.
+func startProxyYAML(t *testing.T, body string) string {
+	t.Helper()
+	yaml := "listeners: [{ addr: \"127.0.0.1:0\" }]\n" + body
 	cfg, err := config.Parse([]byte(yaml), "")
 	if err != nil {
 		t.Fatal(err)

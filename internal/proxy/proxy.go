@@ -12,7 +12,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/MuditGarg007/prism/internal/limits"
+	"github.com/MuditGarg007/prism/internal/ratelimit"
+	"github.com/MuditGarg007/prism/internal/resilience"
 	"github.com/MuditGarg007/prism/internal/router"
 	"github.com/MuditGarg007/prism/internal/upstream"
 )
@@ -26,6 +30,10 @@ type Route struct {
 	PreserveHost bool
 	Request      HeaderOps
 	Response     HeaderOps
+	RateLimit    *ratelimit.Limiter // per client IP; nil for none
+	MaxBody      int64              // request body limit in bytes; 0 for none
+	Concurrency  *limits.Semaphore  // requests served at once; nil for no cap
+	Retry        *resilience.Retry  // nil for no retries
 }
 
 // Annotations record how the proxy handled one request, for the access log.
@@ -33,6 +41,7 @@ type Annotations struct {
 	Route    *Route
 	Backend  *upstream.Backend
 	ClientIP netip.Addr
+	Attempts int    // backends tried, counting the first
 	Error    string // why forwarding failed, if it did
 }
 
@@ -78,6 +87,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	an.Route = rt
+	if rt.RateLimit != nil {
+		if ok, wait := rt.RateLimit.Allow(an.ClientIP); !ok {
+			reject(w, an, http.StatusTooManyRequests, kindRateLimited, wait)
+			return
+		}
+	}
+	if rt.MaxBody > 0 {
+		// A declared length over the limit is refused before reading
+		// anything, so a client that sent "Expect: 100-continue" never gets
+		// the go-ahead to upload.
+		if r.ContentLength > rt.MaxBody {
+			closeAfter(w, r)
+			reject(w, an, http.StatusRequestEntityTooLarge, kindBodyTooLarge, 0)
+			return
+		}
+		// net/http already stops a declared-length body at its length, so
+		// only a body of unknown length needs counting.
+		if r.ContentLength < 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, rt.MaxBody)
+		}
+	}
+	if rt.Concurrency != nil {
+		if !rt.Concurrency.TryAcquire() {
+			reject(w, an, http.StatusServiceUnavailable, kindOverloaded, time.Second)
+			return
+		}
+		// Held until forward returns, which is after the whole response
+		// body is copied: a slow stream is still load on the backend.
+		defer rt.Concurrency.Release()
+	}
 	h.forward(w, r, rt, an)
 }
 
@@ -101,18 +140,38 @@ func validPath(p string) bool {
 }
 
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations) {
-	b, err := rt.Pool.Pick(r)
+	body, err := newRequestBody(r, rt.Retry != nil)
+	if err != nil {
+		h.clientBodyFailed(w, r, rt, an, err)
+		return
+	}
+	choice := upstream.Choice{ClientIP: an.ClientIP}
+	b, err := rt.Pool.Pick(choice)
 	if err != nil {
 		h.fail(w, r, rt, nil, an, err)
 		return
 	}
-	an.Backend = b
-	out := h.outgoing(r, rt, b)
-
-	b.Acquire()
+	var resp *http.Response
+	for {
+		an.Backend = b
+		an.Attempts++
+		b.Acquire()
+		// RoundTrip, not http.Client, so redirects go back to the client.
+		resp, err = b.Transport.RoundTrip(h.outgoing(r, rt, b, &body))
+		next := h.retryTarget(r, rt, an, &body, &choice, b, resp, err)
+		if next == nil {
+			break
+		}
+		if err != nil {
+			_, kind := classify(r.Context(), err)
+			h.logError(r, slog.LevelWarn, "upstream attempt failed, retrying", rt, b, 0, kind, err)
+		} else {
+			resp.Body.Close()
+		}
+		b.Release()
+		b = next
+	}
 	defer b.Release()
-	// RoundTrip, not http.Client, so redirects go back to the client.
-	resp, err := b.Transport.RoundTrip(out)
 	if err != nil {
 		h.fail(w, r, rt, b, an, err)
 		return
@@ -163,9 +222,35 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 	}
 }
 
+// retryTarget returns the backend to try next after an attempt on b ended
+// with resp or err, or nil if the request must not be retried. A retry goes
+// only to a backend this request has not tried, so it stops once the pool
+// runs out, and the last attempt's result goes to the client as it is.
+func (h *Handler) retryTarget(r *http.Request, rt *Route, an *Annotations, body *requestBody, choice *upstream.Choice, b *upstream.Backend, resp *http.Response, err error) *upstream.Backend {
+	p := rt.Retry
+	if p == nil || an.Attempts > p.Attempts || r.Context().Err() != nil {
+		return nil
+	}
+	var a resilience.Attempt
+	if err != nil {
+		a.Connect, a.Timeout = failedConnect(err), timedOut(err)
+	} else {
+		a.Status = resp.StatusCode
+	}
+	if !p.Retryable(a, resilience.Idempotent(r.Method)) || !body.replayable() {
+		return nil
+	}
+	choice.Tried = append(choice.Tried, b)
+	next, err := rt.Pool.Pick(*choice)
+	if err != nil {
+		return nil
+	}
+	return next
+}
+
 // outgoing builds the request to send to b. Its context is r's, so a client
 // that disconnects cancels the backend request too.
-func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend) *http.Request {
+func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend, rb *requestBody) *http.Request {
 	hdr := r.Header.Clone()
 	cleanRequestHeaders(hdr)
 	h.fwd.Apply(hdr, PeerAddr(r.RemoteAddr), r.Host, r.TLS != nil)
@@ -186,11 +271,7 @@ func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend) *htt
 		hdr["User-Agent"] = []string{""}
 	}
 
-	// Never buffer the body: pass it straight through.
-	body := r.Body
-	if r.ContentLength == 0 {
-		body = http.NoBody
-	}
+	body, getBody := rb.attempt()
 	out := &http.Request{
 		Method:        r.Method,
 		URL:           targetURL(b.URL, r.URL, rt.PathPrefix, rt.StripPrefix),
@@ -199,6 +280,7 @@ func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend) *htt
 		ProtoMinor:    1,
 		Header:        hdr,
 		Body:          body,
+		GetBody:       getBody,
 		ContentLength: r.ContentLength,
 		Trailer:       r.Trailer,
 		Host:          host,

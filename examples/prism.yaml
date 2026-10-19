@@ -19,6 +19,8 @@ upstreams:
     backends:
       - { url: "http://10.0.0.1:8080", weight: 3 }
       - { url: "https://10.0.0.2:8443", weight: 1, tls: { server_name: api.internal } }
+    # health and circuit_breaker are accepted but ignored (with a warning)
+    # until M3.
     health: { path: /healthz, interval: 5s, timeout: 1s, unhealthy_after: 3, healthy_after: 2 }
     circuit_breaker: { failure_ratio: 0.5, min_requests: 20, open_for: 30s }
     timeouts: { connect: 2s, response_header: 10s, idle_conn: 90s }
@@ -33,11 +35,15 @@ routes:
     upstream: api
     strip_prefix: true
     headers: { request_set: { X-Env: prod }, response_remove: [Server] }
+    # Per client IP (after trusted_proxies), refused with 429 + Retry-After.
     rate_limit: { per_ip: "100/s", burst: 50 }
-    max_body: 10MB
-    max_concurrency: 500
+    max_body: 10MB                # 413 when larger
+    max_concurrency: 500          # in-flight requests; more get 503 + Retry-After: 1
+    # Retries go only to a backend this request has not tried. connect_error
+    # retries any method; timeout and 5xx retry only idempotent ones.
+    # budget_ratio has no effect until M3.
     retry: { attempts: 2, on: [connect_error, 502, 503], budget_ratio: 0.2 }
-    cache: { enabled: true, max_object: 1MB }
+    cache: { enabled: true, max_object: 1MB }  # ignored (with a warning) until M4
 
   - match: { path_prefix: "/" }
     upstream: static

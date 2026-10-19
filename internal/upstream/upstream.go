@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"slices"
 	"sync/atomic"
 
 	"github.com/MuditGarg007/prism/internal/config"
@@ -15,11 +17,32 @@ import (
 // ErrNoBackend is returned by a Balancer when every backend is unavailable.
 var ErrNoBackend = errors.New("no available backend")
 
-// Balancer picks the backend for a request.
+// Balancer picks the backend for a request from the backends it was built
+// with. Building it with its backends lets a balancer keep per-backend state,
+// such as smooth weighted round robin's current weights or a hash ring.
 type Balancer interface {
-	// Pick must skip unavailable backends and return ErrNoBackend if none
-	// is left. It is called concurrently.
-	Pick(r *http.Request, bs []*Backend) (*Backend, error)
+	// Pick must skip every backend that c.Usable rejects and return
+	// ErrNoBackend if none is left. It is called concurrently.
+	Pick(c Choice) (*Backend, error)
+}
+
+// NewBalancer builds a Balancer over a pool's backends.
+type NewBalancer func(bs []*Backend) Balancer
+
+// Choice is what a Balancer knows about the request it picks for.
+type Choice struct {
+	// ClientIP is the client address worked out from trusted proxies, never
+	// the raw X-Forwarded-For. It is invalid for non-IP peers.
+	ClientIP netip.Addr
+	// Tried holds the backends this request has already failed on, so a
+	// retry goes to a different one.
+	Tried []*Backend
+}
+
+// Usable reports whether b may be picked: it is available and has not been
+// tried yet.
+func (c Choice) Usable(b *Backend) bool {
+	return b.Available() && !slices.Contains(c.Tried, b)
 }
 
 // Backend is one server in a pool.
@@ -58,11 +81,11 @@ type Pool struct {
 	balancer Balancer
 }
 
-// NewPool builds the backends of u and a transport for each one. A
-// transport per backend, not per pool, lets each backend have its own TLS
-// settings.
-func NewPool(name string, u *config.Upstream, bal Balancer) (*Pool, error) {
-	p := &Pool{Name: name, balancer: bal}
+// NewPool builds the backends of u, a transport for each one, and a balancer
+// over them. A transport per backend, not per pool, lets each backend have
+// its own TLS settings.
+func NewPool(name string, u *config.Upstream, newBal NewBalancer) (*Pool, error) {
+	p := &Pool{Name: name}
 	for i, bc := range u.Backends {
 		b, err := newBackend(u, bc)
 		if err != nil {
@@ -71,6 +94,7 @@ func NewPool(name string, u *config.Upstream, bal Balancer) (*Pool, error) {
 		}
 		p.Backends = append(p.Backends, b)
 	}
+	p.balancer = newBal(p.Backends)
 	return p, nil
 }
 
@@ -86,9 +110,9 @@ func newBackend(u *config.Upstream, bc config.Backend) (*Backend, error) {
 	return &Backend{URL: target, Weight: bc.Weight, Transport: tr}, nil
 }
 
-// Pick chooses the backend for r.
-func (p *Pool) Pick(r *http.Request) (*Backend, error) {
-	return p.balancer.Pick(r, p.Backends)
+// Pick chooses a backend for one request.
+func (p *Pool) Pick(c Choice) (*Backend, error) {
+	return p.balancer.Pick(c)
 }
 
 // Close closes idle connections to every backend. Requests in flight keep

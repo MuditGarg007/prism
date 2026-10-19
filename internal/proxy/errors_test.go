@@ -125,6 +125,7 @@ func TestClassify(t *testing.T) {
 		{"backend hung up", context.Background(), hangup, 502, kindUpstream},
 		{"no backend", context.Background(), fmt.Errorf("pick: %w", upstream.ErrNoBackend), 503, kindNoBackend},
 		{"other error", context.Background(), errors.New("boom"), 502, kindUpstream},
+		{"body over max_body", context.Background(), fmt.Errorf("write: %w", &http.MaxBytesError{Limit: 10}), 413, kindBodyTooLarge},
 		{"client canceled", canceled, context.Canceled, 499, kindClientClosed},
 		{"client canceled during backend error", canceled, refused, 499, kindClientClosed},
 		{"request deadline is not the client leaving", expired, context.DeadlineExceeded, 504, kindTimeout},

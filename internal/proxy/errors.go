@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/MuditGarg007/prism/internal/upstream"
 )
@@ -25,6 +27,10 @@ const (
 	kindTimeout      errorKind = "timeout"
 	kindConnect      errorKind = "connect"
 	kindUpstream     errorKind = "upstream"
+	kindRateLimited  errorKind = "rate_limited"
+	kindBodyTooLarge errorKind = "body_too_large"
+	kindOverloaded   errorKind = "overloaded"
+	kindClientBody   errorKind = "client_body"
 )
 
 // classify maps a forwarding error to the status the client gets. ctx is the
@@ -39,22 +45,41 @@ const (
 // means. Envoy answers "no healthy upstream" the same way. Timeouts are 504
 // whether they hit while connecting or while waiting for headers, as in
 // nginx. Everything else, including a refused connection, is 502.
+//
+// A *http.MaxBytesError is the client's body passing max_body while it was
+// being sent; the transport hands back the body's read error as its own.
 func classify(ctx context.Context, err error) (int, errorKind) {
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return StatusClientClosedRequest, kindClientClosed
 	}
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return http.StatusRequestEntityTooLarge, kindBodyTooLarge
+	}
 	if errors.Is(err, upstream.ErrNoBackend) {
 		return http.StatusServiceUnavailable, kindNoBackend
 	}
-	var ne net.Error
-	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+	if timedOut(err) {
 		return http.StatusGatewayTimeout, kindTimeout
 	}
-	var oe *net.OpError
-	if errors.As(err, &oe) && oe.Op == "dial" {
+	if failedConnect(err) {
 		return http.StatusBadGateway, kindConnect
 	}
 	return http.StatusBadGateway, kindUpstream
+}
+
+// timedOut reports whether err is a timeout, while connecting or while
+// waiting for the response headers.
+func timedOut(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
+
+// failedConnect reports whether err came from dialing the backend, timeouts
+// included, so the backend never saw the request.
+func failedConnect(err error) bool {
+	var oe *net.OpError
+	return errors.As(err, &oe) && oe.Op == "dial"
 }
 
 // fail answers a request that could not be forwarded, before any of the
@@ -63,12 +88,57 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, rt *Route, b *ups
 	status, kind := classify(r.Context(), err)
 	an.Error = string(kind)
 	level, msg := slog.LevelWarn, "upstream request failed"
-	if kind == kindClientClosed {
+	switch kind {
+	case kindClientClosed:
 		level, msg = slog.LevelDebug, "client closed request"
+	case kindBodyTooLarge:
+		// The client's fault, and as easy to flood with as a rate limit.
+		level, msg = slog.LevelDebug, "request body too large"
+		closeAfter(w, r)
 	}
 	h.logError(r, level, msg, rt, b, status, kind, err)
 	if kind == kindClientClosed {
 		return
+	}
+	http.Error(w, http.StatusText(status), status)
+}
+
+// closeAfter asks net/http to close an HTTP/1 connection once the response
+// is sent. After a 413 the rest of the body is still unread on the
+// connection. MaxBytesReader would arrange this itself, but it cannot see
+// through the access log's writer. HTTP/2 needs nothing: the stream is
+// reset, and "Connection: close" there would shut down every other stream.
+func closeAfter(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "close")
+	}
+}
+
+// clientBodyFailed answers a request whose body could not be read from the
+// client before forwarding, which is the client's fault, not a backend's.
+func (h *Handler) clientBodyFailed(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations, err error) {
+	status, kind := http.StatusBadRequest, kindClientBody
+	if errors.Is(r.Context().Err(), context.Canceled) {
+		status, kind = StatusClientClosedRequest, kindClientClosed
+	}
+	an.Error = string(kind)
+	h.logError(r, slog.LevelDebug, "reading request body failed", rt, nil, status, kind, err)
+	if kind == kindClientClosed {
+		return
+	}
+	closeAfter(w, r)
+	http.Error(w, http.StatusText(status), status)
+}
+
+// reject refuses a request before it is forwarded because it hit a limit.
+// It writes no log line of its own, only the access log entry: under a flood,
+// a warning per rejected request would be a second flood.
+func reject(w http.ResponseWriter, an *Annotations, status int, kind errorKind, retryAfter time.Duration) {
+	an.Error = string(kind)
+	if retryAfter > 0 {
+		// Whole seconds, rounded up so a client that waits is let in.
+		secs := (retryAfter + time.Second - 1) / time.Second
+		w.Header().Set("Retry-After", strconv.FormatInt(int64(secs), 10))
 	}
 	http.Error(w, http.StatusText(status), status)
 }
