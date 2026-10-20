@@ -189,7 +189,7 @@ Start M4 (caching) from `docs/project-plan.md`. `cache` is the only option left 
 
 ## Open items carried forward
 
-- [ ] **Retries come in bursts during a long outage.** The budget bounds retries over any 10 s, which the outage run confirms (1.118 overall). But once the budget is spent, a retry is allowed again only as an old one leaves the window, so they return as one burst every 10 s, about 2.9× for one second at 300 req/s; `docs/m3-chaos/outage.svg` shows it. Finagle's windowed budget does the same. A token bucket (deposit `ratio` per request plus `min_per_sec` per second, capped) would spread them out evenly, at the cost of the exact per-window bound. That would change D7, so it needs the user's call.
+- [x] **Retries come in bursts during a long outage. Kept as is (user's call, 2026-10-20).** The budget bounds retries over any 10 s, which the outage run confirms (1.118 overall). Once it is spent, retries come back as one burst every 10 s, about 2.9× for one second at 300 req/s; `docs/m3-chaos/outage.svg` shows it. Finagle's windowed budget does the same. A token bucket would smooth it at the cost of the exact per-window bound; D7 stays as decided.
 - [ ] **State across reloads (M5).** Breakers, outlier state and health live on `Backend` and `Pool`, so M5 can carry them over for backends whose identity hasn't changed. Today a reload resets them, and a new runtime's backends start healthy. M5 must also call `Start()` on the new runtime and `Close()` on the old one, which stops its health checks.
 - [ ] **Readiness on the admin port (M5).** `ready_path` lives on the main listeners until the admin listener exists.
 - [ ] **WebSocket (M6).** `cleanRequestHeaders` still strips `Upgrade`, and nothing registers with `TrackHijacked` yet.
