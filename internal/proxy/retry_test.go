@@ -286,3 +286,72 @@ func BenchmarkProxyReplayBody(b *testing.B) {
 		resp.Body.Close()
 	}
 }
+
+// TestProxyRetryBudget checks that once a route's retries use up its budget,
+// failed requests go back to the client after one attempt, and the access
+// log says why.
+func TestProxyRetryBudget(t *testing.T) {
+	a, aHits := statusBackend(t, "a", 503)
+	b, bHits := statusBackend(t, "b", 503)
+	p := retryPolicy(t, 1, "503")
+	p.Budget = resilience.NewBudget(0, 1) // no share, a floor of 10 per window
+	h := newHandler(t, poolUpstream(a.URL, b.URL), &Route{Retry: p}, slog.New(slog.DiscardHandler))
+	for i := range 15 {
+		w := send(h, "GET", nil)
+		retried := i < 10
+		if want := 1 + btoi(retried); w.an.Attempts != want || w.an.BudgetExhausted == retried {
+			t.Errorf("request %d: %d attempts, budget exhausted %v", i, w.an.Attempts, w.an.BudgetExhausted)
+		}
+		if w.Code != 503 {
+			t.Errorf("request %d got %d, want the backend's 503", i, w.Code)
+		}
+	}
+	if got := aHits.Load() + bHits.Load(); got != 25 {
+		t.Errorf("backends got %d requests, want 15 + 10 retries", got)
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// TestProxyRetryBackoffCanceled checks that a retry waits out its backoff
+// before going to the next backend, and that a client who leaves during
+// the wait is answered as gone, without the retry being sent.
+func TestProxyRetryBackoffCanceled(t *testing.T) {
+	failing, failHits := statusBackend(t, "failing", 503)
+	ok, okHits := statusBackend(t, "ok", 200)
+	p := retryPolicy(t, 1, "503")
+	p.Backoff = resilience.Backoff{Base: time.Hour, Max: time.Hour}
+	h := newHandler(t, poolUpstream(failing.URL, ok.URL), &Route{Retry: p}, slog.New(slog.DiscardHandler))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &annotatedRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil).WithContext(ctx))
+		close(done)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); failHits.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("first attempt never sent")
+		}
+	}
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("request finished without backing off")
+	default:
+	}
+	cancel()
+	<-done
+	if okHits.Load() != 0 || w.an.Error != "client_closed" || w.Body.Len() != 0 {
+		t.Errorf("after a cancel in backoff: %d retries sent, error %q, body %q", okHits.Load(), w.an.Error, w.Body)
+	}
+	if b := w.an.Route.Pool.Backends[1]; b.Inflight() != 0 {
+		t.Errorf("next backend has %d in flight", b.Inflight())
+	}
+}

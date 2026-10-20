@@ -14,6 +14,7 @@ import (
 
 	"github.com/MuditGarg007/prism/internal/balancer"
 	"github.com/MuditGarg007/prism/internal/config"
+	"github.com/MuditGarg007/prism/internal/health"
 	"github.com/MuditGarg007/prism/internal/limits"
 	"github.com/MuditGarg007/prism/internal/proxy"
 	"github.com/MuditGarg007/prism/internal/ratelimit"
@@ -28,6 +29,8 @@ type Runtime struct {
 	Config  *config.Config
 	Handler *proxy.Handler
 	Pools   map[string]*upstream.Pool
+
+	checkers []*health.Checker // started by Start
 }
 
 // Build creates the pools, routes and handler for cfg, which must already be
@@ -39,16 +42,21 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 	// Sorted, so warnings and errors come out in the same order every time.
 	for _, name := range slices.Sorted(maps.Keys(cfg.Upstreams)) {
 		u := cfg.Upstreams[name]
-		warnIgnored(log, "upstreams."+name, map[string]bool{
-			"health":          u.Health != nil,
-			"circuit_breaker": u.CircuitBreaker != nil,
-		})
-		pool, err := upstream.NewPool(name, u, balancer.New(u.Balancer))
+		pool, err := upstream.NewPool(name, u, balancer.New(u.Balancer), log)
 		if err != nil {
 			rt.Close()
 			return nil, err
 		}
 		rt.Pools[name] = pool
+		if h := u.Health; h != nil {
+			rt.checkers = append(rt.checkers, health.New(pool, health.Config{
+				Path:           h.Path,
+				Interval:       h.Interval,
+				Timeout:        h.Timeout,
+				UnhealthyAfter: h.UnhealthyAfter,
+				HealthyAfter:   h.HealthyAfter,
+			}, log))
+		}
 	}
 
 	entries := make([]router.Entry[*proxy.Route], 0, len(cfg.Routes))
@@ -66,8 +74,6 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 		if rl := r.RateLimit; rl != nil {
 			limiter = ratelimit.New(rl.PerIP.Count, rl.PerIP.Per, rl.Burst)
 		}
-		// budget_ratio is accepted but has no effect until M3 adds the
-		// retry budget.
 		var retry *resilience.Retry
 		if rc := r.Retry; rc != nil && rc.Attempts > 0 {
 			var err error
@@ -75,10 +81,12 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 				rt.Close()
 				return nil, fmt.Errorf("routes[%d].retry: %w", i, err)
 			}
+			retry.Backoff = resilience.Backoff{Base: rc.Backoff.Base, Max: rc.Backoff.Max}
+			retry.Budget = resilience.NewBudget(rc.BudgetRatio, rc.BudgetMinPerSec)
 		}
 		var sem *limits.Semaphore
 		if r.MaxConcurrency > 0 {
-			sem = limits.NewSemaphore(r.MaxConcurrency)
+			sem = limits.NewSemaphore(r.MaxConcurrency, r.QueueSize)
 		}
 		entries = append(entries, router.Entry[*proxy.Route]{
 			Host:       r.Match.Host,
@@ -94,6 +102,7 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 				RateLimit:    limiter,
 				MaxBody:      int64(r.MaxBody),
 				Concurrency:  sem,
+				QueueTimeout: r.QueueTimeout,
 				Retry:        retry,
 			},
 		})
@@ -118,14 +127,29 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 func warnIgnored(log *slog.Logger, path string, set map[string]bool) {
 	for _, name := range slices.Sorted(maps.Keys(set)) {
 		if set[name] {
-			log.Warn("config option is not implemented yet and is ignored", "option", path+"."+name)
+			if path != "" {
+				name = path + "." + name
+			}
+			log.Warn("config option is not implemented yet and is ignored", "option", name)
 		}
 	}
 }
 
-// Close closes the idle backend connections of every pool. Requests still
-// using rt keep their connections.
+// Start starts the background work of rt, which is active health checking.
+// Build never starts it, so -validate sends nothing to backends. It must be
+// called at most once.
+func (rt *Runtime) Start() {
+	for _, c := range rt.checkers {
+		c.Start()
+	}
+}
+
+// Close stops health checking and closes the idle backend connections of
+// every pool. Requests still using rt keep their connections.
 func (rt *Runtime) Close() {
+	for _, c := range rt.checkers {
+		c.Stop()
+	}
 	for _, p := range rt.Pools {
 		p.Close()
 	}

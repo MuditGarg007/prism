@@ -3,8 +3,10 @@
 package upstream
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/MuditGarg007/prism/internal/config"
+	"github.com/MuditGarg007/prism/internal/resilience"
 )
 
 // ErrNoBackend is returned by a Balancer when every backend is unavailable.
@@ -53,6 +56,11 @@ type Backend struct {
 
 	inflight  atomic.Int64
 	unhealthy atomic.Bool // inverted so a zero Backend is available
+
+	breaker *resilience.Breaker // nil when the upstream has no circuit_breaker
+	outlier *resilience.Outlier // shared by the pool; nil without outlier
+	index   int                 // this backend's member number in outlier
+	log     *slog.Logger
 }
 
 // Inflight is the number of requests currently being forwarded to b.
@@ -64,9 +72,58 @@ func (b *Backend) Acquire() { b.inflight.Add(1) }
 // Release marks a request started with Acquire as finished.
 func (b *Backend) Release() { b.inflight.Add(-1) }
 
-// Available reports whether b may receive requests. M3 adds the circuit
-// breaker and outlier ejection to this check.
-func (b *Backend) Available() bool { return !b.unhealthy.Load() }
+// Available reports whether b may receive requests: it is healthy, not
+// ejected, and its circuit breaker is not open. Every check is an atomic
+// load, because balancers call this on every pick.
+func (b *Backend) Available() bool {
+	return !b.unhealthy.Load() &&
+		(b.breaker == nil || b.breaker.Ready()) &&
+		(b.outlier == nil || !b.outlier.Ejected(b.index))
+}
+
+// Admission is a request's permission to use a backend, from Admit. It goes
+// back to Report with the request's outcome.
+type Admission struct{ ticket resilience.Ticket }
+
+// Admit asks b's circuit breaker to let a request through. Balancers only
+// skip backends whose breaker is open; a half-open breaker refuses here once
+// its probe slots are taken. Every admitted request must be reported.
+func (b *Backend) Admit() (Admission, bool) {
+	if b.breaker == nil {
+		return Admission{}, true
+	}
+	t, ok := b.breaker.Allow()
+	return Admission{t}, ok
+}
+
+// Report records how an admitted request went, for the circuit breaker and
+// outlier detection.
+func (b *Backend) Report(a Admission, out resilience.Outcome) {
+	if b.breaker != nil {
+		b.breaker.Report(a.ticket, out)
+	}
+	if b.outlier != nil {
+		if d := b.outlier.Report(b.index, out); d > 0 {
+			b.log.Warn("backend ejected after consecutive failures", "for", d)
+		}
+	}
+}
+
+// Overturn records that a request reported as a success failed after all,
+// because the response body broke off.
+func (b *Backend) Overturn(a Admission) {
+	if b.breaker != nil {
+		b.breaker.Overturn(a.ticket)
+	}
+	if b.outlier != nil {
+		if d := b.outlier.Report(b.index, resilience.Failure); d > 0 {
+			b.log.Warn("backend ejected after consecutive failures", "for", d)
+		}
+	}
+}
+
+// Breaker returns b's circuit breaker, or nil if it has none.
+func (b *Backend) Breaker() *resilience.Breaker { return b.breaker }
 
 // SetHealthy records the result of health checking b.
 func (b *Backend) SetHealthy(ok bool) { b.unhealthy.Store(!ok) }
@@ -83,19 +140,48 @@ type Pool struct {
 
 // NewPool builds the backends of u, a transport for each one, and a balancer
 // over them. A transport per backend, not per pool, lets each backend have
-// its own TLS settings.
-func NewPool(name string, u *config.Upstream, newBal NewBalancer) (*Pool, error) {
+// its own TLS settings. State changes of backends, such as a breaker
+// opening, are logged to log.
+func NewPool(name string, u *config.Upstream, newBal NewBalancer, log *slog.Logger) (*Pool, error) {
 	p := &Pool{Name: name}
+	var outlier *resilience.Outlier
+	if o := u.Outlier; o != nil {
+		outlier = resilience.NewOutlier(len(u.Backends), resilience.OutlierConfig{
+			ConsecutiveFailures: o.ConsecutiveFailures,
+			BaseEjection:        o.BaseEjection,
+			MaxEjection:         o.MaxEjection,
+			MaxEjectionPercent:  o.MaxEjectionPercent,
+		})
+	}
 	for i, bc := range u.Backends {
 		b, err := newBackend(u, bc)
 		if err != nil {
 			p.Close()
 			return nil, fmt.Errorf("upstream %s: backend %d: %w", name, i, err)
 		}
+		b.log = log.With("upstream", name, "backend", b.String())
+		b.outlier, b.index = outlier, i
+		if cb := u.CircuitBreaker; cb != nil {
+			b.breaker = resilience.NewBreaker(resilience.BreakerConfig{
+				FailureRatio:   cb.FailureRatio,
+				MinRequests:    cb.MinRequests,
+				OpenFor:        cb.OpenFor,
+				Window:         cb.Window,
+				HalfOpenProbes: cb.HalfOpenProbes,
+			}, b.logBreaker)
+		}
 		p.Backends = append(p.Backends, b)
 	}
 	p.balancer = newBal(p.Backends)
 	return p, nil
+}
+
+func (b *Backend) logBreaker(from, to resilience.BreakerState) {
+	level := slog.LevelInfo
+	if to == resilience.BreakerOpen {
+		level = slog.LevelWarn
+	}
+	b.log.Log(context.Background(), level, "circuit breaker state changed", "from", from, "to", to)
 }
 
 func newBackend(u *config.Upstream, bc config.Backend) (*Backend, error) {

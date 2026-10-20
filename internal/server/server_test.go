@@ -67,7 +67,7 @@ func plainListener() config.Listener {
 // start runs a server for listeners and returns the base URL of each one.
 func start(t *testing.T, listeners []config.Listener, h http.Handler, log *slog.Logger) (*Server, []string) {
 	t.Helper()
-	s, err := New(listeners, h, log)
+	s, err := New(listeners, "", h, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func start(t *testing.T, listeners []config.Listener, h http.Handler, log *slog.
 }
 
 func TestServerTimeoutsFromConfig(t *testing.T) {
-	s, err := New([]config.Listener{plainListener()}, http.NotFoundHandler(), slog.New(slog.DiscardHandler))
+	s, err := New([]config.Listener{plainListener()}, "", http.NotFoundHandler(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestStartPortInUse(t *testing.T) {
 	defer busy.Close()
 	l := plainListener()
 	l.Addr = busy.Addr().String()
-	s, err := New([]config.Listener{plainListener(), l}, http.NotFoundHandler(), slog.New(slog.DiscardHandler))
+	s, err := New([]config.Listener{plainListener(), l}, "", http.NotFoundHandler(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,4 +309,93 @@ func TestAccessLogKeepsFlush(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("flushed data did not reach the client")
 	}
+}
+
+func TestServerReadiness(t *testing.T) {
+	logs, log := newTestLogger()
+	s, err := New([]config.Listener{plainListener()}, "/ready", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "routed")
+	}), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Shutdown(context.Background())
+	base := "http://" + s.Addrs()[0].String()
+	get := func(path string) (*http.Response, string) {
+		t.Helper()
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp, string(b)
+	}
+
+	if resp, body := get("/ready"); resp.StatusCode != 200 || body != "ready\n" || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("ready path before Drain: %d %q", resp.StatusCode, body)
+	}
+	if resp, body := get("/ready/x"); body != "routed" || resp.Close {
+		t.Errorf("other path got %q, close %v; want it routed on a kept-alive connection", body, resp.Close)
+	}
+
+	s.Drain()
+	if resp, _ := get("/ready"); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("ready path while draining: %d, want 503", resp.StatusCode)
+	}
+	resp, body := get("/")
+	if body != "routed" {
+		t.Errorf("request while draining got %q, want it still served", body)
+	}
+	if !resp.Close {
+		t.Error("response while draining did not ask the client to close the connection")
+	}
+
+	out := logs.waitFor(t, "path=/ready/x")
+	if strings.Contains(out, "path=/ready ") {
+		t.Errorf("probes of the ready path were access logged: %s", out)
+	}
+}
+
+// TestServerShutdownHijacked checks that Shutdown waits for a tracked
+// connection to finish, and closes one that outlives the deadline.
+func TestServerShutdownHijacked(t *testing.T) {
+	newConn := func(t *testing.T) (net.Conn, net.Conn) {
+		a, b := net.Pipe()
+		t.Cleanup(func() { a.Close(); b.Close() })
+		return a, b
+	}
+
+	t.Run("finishes in time", func(t *testing.T) {
+		s, _ := start(t, []config.Listener{plainListener()}, http.NotFoundHandler(), slog.New(slog.DiscardHandler))
+		c, _ := newConn(t)
+		untrack := s.TrackHijacked(c)
+		time.AfterFunc(30*time.Millisecond, untrack)
+		start := time.Now()
+		if err := s.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if d := time.Since(start); d < 30*time.Millisecond {
+			t.Errorf("Shutdown returned after %v, before the connection was done", d)
+		}
+	})
+
+	t.Run("closed at the deadline", func(t *testing.T) {
+		s, _ := start(t, []config.Listener{plainListener()}, http.NotFoundHandler(), slog.New(slog.DiscardHandler))
+		c, peer := newConn(t)
+		s.TrackHijacked(c)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		err := s.Shutdown(ctx)
+		if err == nil || !strings.Contains(err.Error(), "closed 1 hijacked connections") {
+			t.Fatalf("Shutdown = %v, want the hijacked connection reported", err)
+		}
+		peer.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+			t.Errorf("peer read %v, want EOF from the closed connection", err)
+		}
+	})
 }

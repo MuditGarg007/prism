@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -33,6 +34,7 @@ type Route struct {
 	RateLimit    *ratelimit.Limiter // per client IP; nil for none
 	MaxBody      int64              // request body limit in bytes; 0 for none
 	Concurrency  *limits.Semaphore  // requests served at once; nil for no cap
+	QueueTimeout time.Duration      // longest wait for a Concurrency slot
 	Retry        *resilience.Retry  // nil for no retries
 }
 
@@ -43,6 +45,9 @@ type Annotations struct {
 	ClientIP netip.Addr
 	Attempts int    // backends tried, counting the first
 	Error    string // why forwarding failed, if it did
+	// BudgetExhausted is set when a retry was called for but the route's
+	// retry budget refused it.
+	BudgetExhausted bool
 }
 
 // Annotated is implemented by a ResponseWriter that wants Annotations
@@ -109,7 +114,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if rt.Concurrency != nil {
-		if !rt.Concurrency.TryAcquire() {
+		// A full queue or a wait that times out sheds the request, which
+		// pushes back on clients instead of letting latency grow.
+		if err := rt.Concurrency.Acquire(r.Context(), rt.QueueTimeout); err != nil {
+			if r.Context().Err() != nil {
+				h.fail(w, r, rt, nil, an, err) // the client left while queued
+				return
+			}
 			reject(w, an, http.StatusServiceUnavailable, kindOverloaded, time.Second)
 			return
 		}
@@ -142,23 +153,31 @@ func validPath(p string) bool {
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations) {
 	body, err := newRequestBody(r, rt.Retry != nil)
 	if err != nil {
-		h.clientBodyFailed(w, r, rt, an, err)
+		h.clientBodyFailed(w, r, rt, nil, an, err)
 		return
 	}
+	if p := rt.Retry; p != nil && p.Budget != nil {
+		p.Budget.Request()
+	}
 	choice := upstream.Choice{ClientIP: an.ClientIP}
-	b, err := rt.Pool.Pick(choice)
+	b, adm, err := pick(rt.Pool, &choice)
 	if err != nil {
 		h.fail(w, r, rt, nil, an, err)
 		return
 	}
-	var resp *http.Response
+	var (
+		resp *http.Response
+		out  resilience.Outcome
+	)
 	for {
 		an.Backend = b
 		an.Attempts++
 		b.Acquire()
 		// RoundTrip, not http.Client, so redirects go back to the client.
 		resp, err = b.Transport.RoundTrip(h.outgoing(r, rt, b, &body))
-		next := h.retryTarget(r, rt, an, &body, &choice, b, resp, err)
+		out = outcome(r, &body, resp, err)
+		b.Report(adm, out)
+		next, nextAdm := h.retryTarget(r, rt, an, &body, &choice, b, resp, err)
 		if next == nil {
 			break
 		}
@@ -169,10 +188,24 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 			resp.Body.Close()
 		}
 		b.Release()
-		b = next
+		b, adm = next, nextAdm
+		// The concurrency slot stays held while backing off, so a route
+		// that is retrying a lot takes on less new work.
+		if !sleep(r.Context(), rt.Retry.Delay(an.Attempts-1)) {
+			b.Report(adm, resilience.Neutral)
+			h.fail(w, r, rt, b, an, r.Context().Err())
+			return
+		}
 	}
 	defer b.Release()
 	if err != nil {
+		// The transport hands back the client's body read error as its own.
+		// Passing max_body is still 413, which fail answers.
+		var mbe *http.MaxBytesError
+		if body.clientFailed() && !errors.As(err, &mbe) {
+			h.clientBodyFailed(w, r, rt, b, an, err)
+			return
+		}
 		h.fail(w, r, rt, b, an, err)
 		return
 	}
@@ -215,6 +248,11 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 		return // the client went away
 	}
 	if readErr != nil {
+		// The headers counted as a success, but the backend failed to send
+		// the body it promised.
+		if out == resilience.Success && r.Context().Err() == nil {
+			b.Overturn(adm)
+		}
 		h.abort(r, rt, b, an, readErr)
 	}
 	for k, vv := range resp.Trailer {
@@ -222,14 +260,45 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 	}
 }
 
+// pick chooses a backend whose circuit breaker admits the request. A backend
+// that refuses, a half-open one with every probe slot taken, is skipped like
+// a tried one, so the loop ends once the pool runs out.
+func pick(p *upstream.Pool, c *upstream.Choice) (*upstream.Backend, upstream.Admission, error) {
+	for {
+		b, err := p.Pick(*c)
+		if err != nil {
+			return nil, upstream.Admission{}, err
+		}
+		if adm, ok := b.Admit(); ok {
+			return b, adm, nil
+		}
+		c.Tried = append(c.Tried, b)
+	}
+}
+
+// outcome says what an attempt that ended with resp or err tells about the
+// backend's health. Failures the client caused, by leaving or by sending a
+// broken body, say nothing about it; otherwise a client could get healthy
+// backends ejected.
+func outcome(r *http.Request, body *requestBody, resp *http.Response, err error) resilience.Outcome {
+	switch {
+	case r.Context().Err() != nil || body.clientFailed():
+		return resilience.Neutral
+	case err != nil || resp.StatusCode >= 500:
+		return resilience.Failure
+	}
+	return resilience.Success
+}
+
 // retryTarget returns the backend to try next after an attempt on b ended
-// with resp or err, or nil if the request must not be retried. A retry goes
+// with resp or err, and its admission, or nil if the request must not be
+// retried. A retry goes
 // only to a backend this request has not tried, so it stops once the pool
 // runs out, and the last attempt's result goes to the client as it is.
-func (h *Handler) retryTarget(r *http.Request, rt *Route, an *Annotations, body *requestBody, choice *upstream.Choice, b *upstream.Backend, resp *http.Response, err error) *upstream.Backend {
+func (h *Handler) retryTarget(r *http.Request, rt *Route, an *Annotations, body *requestBody, choice *upstream.Choice, b *upstream.Backend, resp *http.Response, err error) (*upstream.Backend, upstream.Admission) {
 	p := rt.Retry
 	if p == nil || an.Attempts > p.Attempts || r.Context().Err() != nil {
-		return nil
+		return nil, upstream.Admission{}
 	}
 	var a resilience.Attempt
 	if err != nil {
@@ -238,14 +307,33 @@ func (h *Handler) retryTarget(r *http.Request, rt *Route, an *Annotations, body 
 		a.Status = resp.StatusCode
 	}
 	if !p.Retryable(a, resilience.Idempotent(r.Method)) || !body.replayable() {
-		return nil
+		return nil, upstream.Admission{}
+	}
+	if p.Budget != nil && !p.Budget.TryRetry() {
+		an.BudgetExhausted = true
+		return nil, upstream.Admission{}
 	}
 	choice.Tried = append(choice.Tried, b)
-	next, err := rt.Pool.Pick(*choice)
+	next, adm, err := pick(rt.Pool, choice)
 	if err != nil {
-		return nil
+		return nil, upstream.Admission{}
 	}
-	return next
+	return next, adm
+}
+
+// sleep waits for d, or until ctx is done, and reports whether d passed.
+func sleep(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // outgoing builds the request to send to b. Its context is r's, so a client

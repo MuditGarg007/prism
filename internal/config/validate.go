@@ -30,6 +30,7 @@ func (p *problems) add(path, format string, args ...any) {
 
 func (c *Config) validate() error {
 	var p problems
+	c.validateLifecycle(&p)
 	c.validateListeners(&p)
 	c.validateUpstreams(&p)
 	c.validateRoutes(&p)
@@ -37,6 +38,16 @@ func (c *Config) validate() error {
 		return &ValidationError{Problems: p}
 	}
 	return nil
+}
+
+func (c *Config) validateLifecycle(p *problems) {
+	if rp := c.ReadyPath; rp != "" && (!strings.HasPrefix(rp, "/") || strings.ContainsAny(rp, "?#")) {
+		p.add("ready_path", "must be a path starting with \"/\", got %q", rp)
+	}
+	if c.Shutdown.DrainDelay < 0 {
+		p.add("shutdown.drain_delay", "must not be negative, got %v", c.Shutdown.DrainDelay)
+	}
+	checkPositive(p, "shutdown.timeout", c.Shutdown.Timeout)
 }
 
 func (c *Config) validateListeners(p *problems) {
@@ -112,6 +123,9 @@ func (c *Config) validateUpstreams(p *problems) {
 		if cb := u.CircuitBreaker; cb != nil {
 			validateBreaker(p, path+".circuit_breaker", cb)
 		}
+		if o := u.Outlier; o != nil {
+			validateOutlier(p, path+".outlier", o)
+		}
 	}
 }
 
@@ -161,6 +175,23 @@ func validateBreaker(p *problems, path string, cb *CircuitBreaker) {
 	}
 	checkMin(p, path+".min_requests", cb.MinRequests, 1)
 	checkPositive(p, path+".open_for", cb.OpenFor)
+	// The window is split into 10 buckets; below a second they get too fine
+	// to say anything about a ratio.
+	if cb.Window < time.Second {
+		p.add(path+".window", "must be at least 1s, got %v", cb.Window)
+	}
+	checkMin(p, path+".half_open_probes", cb.HalfOpenProbes, 1)
+}
+
+func validateOutlier(p *problems, path string, o *Outlier) {
+	checkMin(p, path+".consecutive_failures", o.ConsecutiveFailures, 1)
+	checkPositive(p, path+".base_ejection", o.BaseEjection)
+	if o.MaxEjection < o.BaseEjection {
+		p.add(path+".max_ejection", "must be at least base_ejection (%v), got %v", o.BaseEjection, o.MaxEjection)
+	}
+	if o.MaxEjectionPercent < 1 || o.MaxEjectionPercent > 100 {
+		p.add(path+".max_ejection_percent", "must be between 1 and 100, got %d", o.MaxEjectionPercent)
+	}
 }
 
 func (c *Config) validateRoutes(p *problems) {
@@ -197,6 +228,15 @@ func (c *Config) validateRoutes(p *problems) {
 		}
 		validateHeaders(p, path+".headers", r.Headers)
 		checkMin(p, path+".max_concurrency", r.MaxConcurrency, 0)
+		checkMin(p, path+".queue_size", r.QueueSize, 0)
+		if r.QueueSize > 0 {
+			if r.MaxConcurrency == 0 {
+				p.add(path+".queue_size", "needs max_concurrency, since without it nothing ever waits")
+			}
+			checkPositive(p, path+".queue_timeout", r.QueueTimeout)
+		} else if r.QueueTimeout != 0 {
+			p.add(path+".queue_timeout", "set without queue_size, so no request ever waits")
+		}
 		if rt := r.Retry; rt != nil {
 			validateRetry(p, path+".retry", rt)
 		}
@@ -287,6 +327,11 @@ func validateRetry(p *problems, path string, rt *Retry) {
 	}
 	if rt.BudgetRatio <= 0 || rt.BudgetRatio > 1 {
 		p.add(path+".budget_ratio", "must be in (0, 1], got %v", rt.BudgetRatio)
+	}
+	checkMin(p, path+".budget_min_per_sec", rt.BudgetMinPerSec, 1)
+	checkPositive(p, path+".backoff.base", rt.Backoff.Base)
+	if rt.Backoff.Max < rt.Backoff.Base {
+		p.add(path+".backoff.max", "must be at least backoff.base (%v), got %v", rt.Backoff.Base, rt.Backoff.Max)
 	}
 	for i, cond := range rt.On {
 		if !validRetryOn(cond) {

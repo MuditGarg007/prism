@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 
-.PHONY: all build test vet staticcheck lint bench fuzz validate clean
+.PHONY: all build test vet staticcheck lint bench fuzz validate chaos clean
 
 all: lint test
 
@@ -29,9 +29,16 @@ fuzz:
 	go test -run='^$$' -fuzz=FuzzClientIP -fuzztime=30s ./internal/proxy
 	go test -run='^$$' -fuzz=FuzzValidPath -fuzztime=30s ./internal/proxy
 	go test -run='^$$' -fuzz=FuzzGCRA -fuzztime=30s ./internal/ratelimit
+	go test -run='^$$' -fuzz=FuzzWindow -fuzztime=30s ./internal/resilience
+	go test -run='^$$' -fuzz=FuzzBudget -fuzztime=30s ./internal/resilience
 
 validate: build
 	./bin/prism -config examples/prism.yaml -validate
+
+# About 90 s. Results and a graph.svg for each scenario go to bin/chaos.
+chaos:
+	scripts/chaos/kill-backend.sh
+	scripts/chaos/outage.sh
 
 clean:
 	rm -rf bin

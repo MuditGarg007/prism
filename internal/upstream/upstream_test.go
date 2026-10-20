@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MuditGarg007/prism/internal/config"
+	"github.com/MuditGarg007/prism/internal/resilience"
 )
 
 // firstBalancer always picks the first usable backend.
@@ -49,7 +51,7 @@ func TestNewPool(t *testing.T) {
 		config.Backend{URL: "http://127.0.0.1:9000", Weight: 3},
 		config.Backend{URL: "https://10.0.0.2:8443", Weight: 1},
 	)
-	p, err := NewPool("api", u, newFirst)
+	p, err := NewPool("api", u, newFirst, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +130,80 @@ func TestBackendHealth(t *testing.T) {
 // TestBackendTLS checks certificate verification against a custom CA and the
 // name sent in SNI. httptest's certificate is valid for 127.0.0.1 and
 // example.com.
+// TestPoolResilience checks that a pool builds a breaker per backend and one
+// outlier detector for the pool, that Report feeds both, and that either one
+// takes a backend out of Available and logs why.
+func TestPoolResilience(t *testing.T) {
+	backends := []config.Backend{{URL: "http://127.0.0.1:9000", Weight: 1}, {URL: "http://127.0.0.1:9001", Weight: 1}}
+	report := func(b *Backend, out resilience.Outcome, n int) {
+		for range n {
+			adm, ok := b.Admit()
+			if !ok {
+				t.Fatalf("%s refused a request", b)
+			}
+			b.Report(adm, out)
+		}
+	}
+	newPool := func(u *config.Upstream) (*Pool, *strings.Builder) {
+		var logs strings.Builder
+		p, err := NewPool("api", u, newFirst, slog.New(slog.NewTextHandler(&logs, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(p.Close)
+		return p, &logs
+	}
+
+	t.Run("none configured", func(t *testing.T) {
+		p, _ := newPool(testUpstream(backends...))
+		b := p.Backends[0]
+		report(b, resilience.Failure, 100)
+		if b.Breaker() != nil || !b.Available() {
+			t.Error("a pool without circuit_breaker or outlier took a backend out")
+		}
+	})
+
+	t.Run("breaker", func(t *testing.T) {
+		u := testUpstream(backends...)
+		u.CircuitBreaker = &config.CircuitBreaker{FailureRatio: 0.5, MinRequests: 2, OpenFor: time.Hour, Window: 10 * time.Second, HalfOpenProbes: 1}
+		p, logs := newPool(u)
+		a, b := p.Backends[0], p.Backends[1]
+		if a.Breaker() == b.Breaker() {
+			t.Fatal("backends share a breaker")
+		}
+		report(a, resilience.Success, 1)
+		report(a, resilience.Failure, 1)
+		if a.Available() || !b.Available() {
+			t.Errorf("available: %v, %v; want only the failing backend out", a.Available(), b.Available())
+		}
+		if _, ok := a.Admit(); ok {
+			t.Error("open breaker admitted a request")
+		}
+		if got := logs.String(); !strings.Contains(got, `msg="circuit breaker state changed" upstream=api backend=http://127.0.0.1:9000 from=closed to=open`) {
+			t.Errorf("log = %q, want the breaker opening", got)
+		}
+	})
+
+	t.Run("outlier", func(t *testing.T) {
+		u := testUpstream(backends...)
+		u.Outlier = &config.Outlier{ConsecutiveFailures: 3, BaseEjection: time.Hour, MaxEjection: time.Hour, MaxEjectionPercent: 50}
+		p, logs := newPool(u)
+		a, b := p.Backends[0], p.Backends[1]
+		report(a, resilience.Failure, 3)
+		if a.Available() {
+			t.Error("backend still available after 3 failures in a row")
+		}
+		// The cap is pool wide: with one of two out, the other stays.
+		report(b, resilience.Failure, 3)
+		if !b.Available() {
+			t.Error("max_ejection_percent did not keep the last backend in")
+		}
+		if got := logs.String(); !strings.Contains(got, `msg="backend ejected after consecutive failures" upstream=api backend=http://127.0.0.1:9000 for=1h0m0s`) {
+			t.Errorf("log = %q, want the ejection", got)
+		}
+	})
+}
+
 func TestChoiceUsable(t *testing.T) {
 	up, down, tried := &Backend{}, &Backend{}, &Backend{}
 	down.SetHealthy(false)
@@ -178,7 +254,7 @@ func TestBackendTLS(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := NewPool("tls", testUpstream(config.Backend{URL: srv.URL, Weight: 1, TLS: tt.tls}), newFirst)
+			p, err := NewPool("tls", testUpstream(config.Backend{URL: srv.URL, Weight: 1, TLS: tt.tls}), newFirst, slog.New(slog.DiscardHandler))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -230,7 +306,7 @@ func TestBadCAFile(t *testing.T) {
 				config.Backend{URL: "http://127.0.0.1:9000", Weight: 1},
 				config.Backend{URL: "https://127.0.0.1:9443", Weight: 1, TLS: &config.BackendTLS{CAFile: tt.file}},
 			)
-			_, err := NewPool("api", u, newFirst)
+			_, err := NewPool("api", u, newFirst, slog.New(slog.DiscardHandler))
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("got %v, want %v", err, tt.want)
 			}

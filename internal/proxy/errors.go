@@ -115,14 +115,15 @@ func closeAfter(w http.ResponseWriter, r *http.Request) {
 }
 
 // clientBodyFailed answers a request whose body could not be read from the
-// client before forwarding, which is the client's fault, not a backend's.
-func (h *Handler) clientBodyFailed(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations, err error) {
+// client, which is the client's fault, not a backend's. b is the backend the
+// body was being sent to, or nil if it failed before forwarding.
+func (h *Handler) clientBodyFailed(w http.ResponseWriter, r *http.Request, rt *Route, b *upstream.Backend, an *Annotations, err error) {
 	status, kind := http.StatusBadRequest, kindClientBody
 	if errors.Is(r.Context().Err(), context.Canceled) {
 		status, kind = StatusClientClosedRequest, kindClientClosed
 	}
 	an.Error = string(kind)
-	h.logError(r, slog.LevelDebug, "reading request body failed", rt, nil, status, kind, err)
+	h.logError(r, slog.LevelDebug, "reading request body failed", rt, b, status, kind, err)
 	if kind == kindClientClosed {
 		return
 	}

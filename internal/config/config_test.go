@@ -75,6 +75,54 @@ func TestParseDefaults(t *testing.T) {
 	if cfg.TrustedProxies != nil || cfg.ForwardedHeader || cfg.Routes[0].PreserveHost {
 		t.Error("trusted_proxies, forwarded_header and preserve_host must default to off")
 	}
+	if want := (Shutdown{Timeout: defaultShutdownTimeout}); cfg.Shutdown != want || cfg.ReadyPath != "" {
+		t.Errorf("shutdown = %+v, ready_path = %q, want %+v and no ready_path", cfg.Shutdown, cfg.ReadyPath, want)
+	}
+	if u.Outlier != nil || u.CircuitBreaker != nil || u.Health != nil {
+		t.Error("outlier, circuit_breaker and health must be off unless configured")
+	}
+	if r := cfg.Routes[0]; r.QueueSize != 0 || r.QueueTimeout != 0 {
+		t.Errorf("queue_size = %d, queue_timeout = %v, want both zero", r.QueueSize, r.QueueTimeout)
+	}
+}
+
+func TestParseResilienceDefaults(t *testing.T) {
+	in := strings.Replace(minimal, "    backends:", "    circuit_breaker: {}\n    outlier: {}\n    backends:", 1)
+	in = strings.Replace(in, "upstream: web }", "upstream: web, max_concurrency: 10, queue_size: 5, retry: { attempts: 1 } }", 1)
+	cfg, err := Parse([]byte(in), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := cfg.Upstreams["web"]
+	wantCB := CircuitBreaker{
+		FailureRatio:   defaultFailureRatio,
+		MinRequests:    defaultMinRequests,
+		OpenFor:        defaultOpenFor,
+		Window:         defaultBreakerWindow,
+		HalfOpenProbes: defaultHalfOpenProbes,
+	}
+	if *u.CircuitBreaker != wantCB {
+		t.Errorf("circuit_breaker = %+v, want %+v", *u.CircuitBreaker, wantCB)
+	}
+	wantOutlier := Outlier{
+		ConsecutiveFailures: defaultConsecutiveFailures,
+		BaseEjection:        defaultBaseEjection,
+		MaxEjection:         defaultMaxEjection,
+		MaxEjectionPercent:  defaultMaxEjectionPercent,
+	}
+	if *u.Outlier != wantOutlier {
+		t.Errorf("outlier = %+v, want %+v", *u.Outlier, wantOutlier)
+	}
+	r := cfg.Routes[0]
+	if r.QueueTimeout != defaultQueueTimeout {
+		t.Errorf("queue_timeout = %v, want %v", r.QueueTimeout, defaultQueueTimeout)
+	}
+	if r.Retry.BudgetMinPerSec != defaultBudgetMinPerSec {
+		t.Errorf("budget_min_per_sec = %d, want %d", r.Retry.BudgetMinPerSec, defaultBudgetMinPerSec)
+	}
+	if want := (Backoff{Base: defaultBackoffBase, Max: defaultBackoffMax}); r.Retry.Backoff != want {
+		t.Errorf("backoff = %+v, want %+v", r.Retry.Backoff, want)
+	}
 }
 
 func TestParseErrors(t *testing.T) {
@@ -110,6 +158,21 @@ func TestParseErrors(t *testing.T) {
 		{"header value with newline", `upstream: web }`, `upstream: web, headers: { response_set: { X-A: "a\nb" } } }`, "headers.response_set.X-A: value must not contain CR, LF or NUL"},
 		{"hop-by-hop header rule", `upstream: web }`, `upstream: web, headers: { response_remove: [Connection] } }`, `response_remove[0]: "Connection" is a hop-by-hop header`},
 		{"remove host", `upstream: web }`, `upstream: web, headers: { request_remove: [host] } }`, "request_remove[0]: Host cannot be removed"},
+		{"relative ready path", "listeners:", "ready_path: readyz\nlisteners:", `ready_path: must be a path starting with "/"`},
+		{"ready path with query", "listeners:", "ready_path: /ready?x=1\nlisteners:", `ready_path: must be a path`},
+		{"negative drain delay", "listeners:", "shutdown: { drain_delay: -1s }\nlisteners:", "shutdown.drain_delay: must not be negative"},
+		{"negative shutdown timeout", "listeners:", "shutdown: { timeout: -1s }\nlisteners:", "shutdown.timeout: must be positive"},
+		{"breaker window too short", "    backends:", "    circuit_breaker: { window: 500ms }\n    backends:", "circuit_breaker.window: must be at least 1s"},
+		{"negative half open probes", "    backends:", "    circuit_breaker: { half_open_probes: -1 }\n    backends:", "circuit_breaker.half_open_probes: must be at least 1"},
+		{"max ejection below base", "    backends:", "    outlier: { base_ejection: 1m, max_ejection: 30s }\n    backends:", "outlier.max_ejection: must be at least base_ejection"},
+		{"ejection percent over 100", "    backends:", "    outlier: { max_ejection_percent: 101 }\n    backends:", "outlier.max_ejection_percent: must be between 1 and 100"},
+		{"negative consecutive failures", "    backends:", "    outlier: { consecutive_failures: -1 }\n    backends:", "outlier.consecutive_failures: must be at least 1"},
+		{"queue without concurrency", `upstream: web }`, `upstream: web, queue_size: 10 }`, "queue_size: needs max_concurrency"},
+		{"negative queue size", `upstream: web }`, `upstream: web, queue_size: -1 }`, "queue_size: must be at least 0"},
+		{"queue timeout without queue", `upstream: web }`, `upstream: web, queue_timeout: 1s }`, "queue_timeout: set without queue_size"},
+		{"negative queue timeout", `upstream: web }`, `upstream: web, max_concurrency: 1, queue_size: 1, queue_timeout: -1s }`, "queue_timeout: must be positive"},
+		{"negative budget floor", `upstream: web }`, `upstream: web, retry: { attempts: 1, budget_min_per_sec: -1 } }`, "retry.budget_min_per_sec: must be at least 1"},
+		{"backoff max below base", `upstream: web }`, `upstream: web, retry: { attempts: 1, backoff: { base: 1s, max: 10ms } } }`, "retry.backoff.max: must be at least backoff.base"},
 		{"negative max idle conns", "    backends:", "    max_idle_conns_per_host: -1\n    backends:", "upstreams.web.max_idle_conns_per_host: must be at least 1"},
 	}
 	for _, tt := range tests {

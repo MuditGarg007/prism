@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/MuditGarg007/prism/internal/config"
 )
@@ -75,15 +77,13 @@ func TestBuildExample(t *testing.T) {
 	}
 	out := logs.String()
 	for _, want := range []string{
-		"option=upstreams.api.health",
-		"option=upstreams.api.circuit_breaker",
 		"option=routes[0].cache",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("warnings %q do not mention %s", out, want)
 		}
 	}
-	for _, done := range []string{"rate_limit", "max_body", "max_concurrency", "retry"} {
+	for _, done := range []string{"rate_limit", "max_body", "max_concurrency", "retry", "circuit_breaker", "outlier", "health"} {
 		if strings.Contains(out, done) {
 			t.Errorf("warned about %s, which is implemented: %q", done, out)
 		}
@@ -258,4 +258,37 @@ routes:
 	for b.Loop() {
 		cur.ServeHTTP(w, r)
 	}
+}
+
+// TestStartHealth checks that Build sends nothing to backends, so -validate
+// stays quiet, and that Start begins health checks which mark a failing
+// backend down.
+func TestStartHealth(t *testing.T) {
+	var checks atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checks.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer s.Close()
+	rt := build(t, parse(t, fmt.Sprintf(`
+listeners: [{ addr: ":8080" }]
+upstreams:
+  web:
+    backends: [{ url: %q }]
+    health: { path: /healthz, interval: 2ms, timeout: 1ms, unhealthy_after: 1 }
+routes:
+  - { match: { path_prefix: "/" }, upstream: web }
+`, s.URL), ""))
+	time.Sleep(20 * time.Millisecond)
+	if n := checks.Load(); n != 0 {
+		t.Fatalf("%d checks before Start", n)
+	}
+	rt.Start()
+	b := rt.Pools["web"].Backends[0]
+	for deadline := time.Now().Add(5 * time.Second); b.Available(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("backend never marked down")
+		}
+	}
+	rt.Close()
 }

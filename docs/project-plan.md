@@ -35,7 +35,10 @@ prism/
 │   └── admin/                 # admin HTTP API (separate listener)
 ├── test/
 │   ├── e2e/                   # full proxy tests against fake backends
-│   └── faultserver/           # backend that can be slow, flaky, drop mid-body
+│   ├── faultserver/           # backend that can be slow, flaky, drop mid-body
+│   ├── loadgen/               # open-loop load, per-second CSV with amplification
+│   └── chaosplot/             # draws a chaos run as an SVG
+├── scripts/chaos/             # chaos scenarios (make chaos)
 ├── bench/                     # load scripts, nginx comparison configs
 └── examples/prism.yaml
 ```

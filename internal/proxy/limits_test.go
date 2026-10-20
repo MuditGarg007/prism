@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -230,7 +231,7 @@ func waitIdle(t *testing.T, s *limits.Semaphore) {
 
 func TestProxyConcurrencyLimit(t *testing.T) {
 	backend, release := streamingBackend(t)
-	sem := limits.NewSemaphore(2)
+	sem := limits.NewSemaphore(2, 0)
 	h := newHandler(t, testUpstream(backend.URL), &Route{Concurrency: sem}, slog.New(slog.DiscardHandler))
 	front := serve(t, h)
 
@@ -285,7 +286,7 @@ func TestProxyConcurrencyReleasedOnError(t *testing.T) {
 		"truncated body": truncated.URL,
 	} {
 		t.Run(name, func(t *testing.T) {
-			sem := limits.NewSemaphore(1)
+			sem := limits.NewSemaphore(1, 0)
 			h := newHandler(t, testUpstream(url), &Route{Concurrency: sem}, slog.New(slog.DiscardHandler))
 			func() {
 				defer func() { recover() }()
@@ -303,7 +304,7 @@ func TestProxyConcurrencyReleasedOnError(t *testing.T) {
 // takes a slot.
 func TestProxyLimitOrder(t *testing.T) {
 	backend, _ := countingBackend(t)
-	sem := limits.NewSemaphore(1)
+	sem := limits.NewSemaphore(1, 0)
 	h := newHandler(t, testUpstream(backend.URL), &Route{
 		RateLimit:   ratelimit.New(1, time.Minute, 1),
 		MaxBody:     1,
@@ -319,5 +320,100 @@ func TestProxyLimitOrder(t *testing.T) {
 	}
 	if sem.InUse() != 1 {
 		t.Errorf("refused requests changed the slots in use to %d", sem.InUse())
+	}
+}
+
+// TestProxyQueue checks that a request over the cap waits for a slot, that
+// one more than the queue holds is shed at once, and that a wait which runs
+// out is shed too.
+func TestProxyQueue(t *testing.T) {
+	backend, release := streamingBackend(t)
+	sem := limits.NewSemaphore(1, 1)
+	h := newHandler(t, testUpstream(backend.URL), &Route{Concurrency: sem, QueueTimeout: time.Minute}, slog.New(slog.DiscardHandler))
+	front := serve(t, h)
+
+	held, err := http.Get(front + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Body.Close()
+	queued := make(chan int)
+	go func() {
+		resp, err := http.Get(front + "/")
+		if err != nil {
+			queued <- 0
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		queued <- resp.StatusCode
+	}()
+	for deadline := time.Now().Add(5 * time.Second); sem.Waiting() != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("second request never queued")
+		}
+	}
+
+	w := &annotatedRecorder{ResponseRecorder: httptest.NewRecorder()}
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != http.StatusServiceUnavailable || w.an.Error != "overloaded" || w.Header().Get("Retry-After") != "1" {
+		t.Errorf("request over a full queue got %d %q Retry-After %q, want 503 overloaded 1",
+			w.Code, w.an.Error, w.Header().Get("Retry-After"))
+	}
+
+	close(release)
+	io.Copy(io.Discard, held.Body)
+	if code := <-queued; code != http.StatusOK {
+		t.Errorf("queued request got %d, want 200", code)
+	}
+	waitIdle(t, sem)
+}
+
+func TestProxyQueueTimeout(t *testing.T) {
+	backend, hits := countingBackend(t)
+	sem := limits.NewSemaphore(1, 1)
+	h := newHandler(t, testUpstream(backend.URL), &Route{Concurrency: sem, QueueTimeout: 10 * time.Millisecond}, slog.New(slog.DiscardHandler))
+	sem.TryAcquire()
+	defer sem.Release()
+
+	start := time.Now()
+	w := &annotatedRecorder{ResponseRecorder: httptest.NewRecorder()}
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != http.StatusServiceUnavailable || w.an.Error != "overloaded" {
+		t.Errorf("got %d %q, want 503 overloaded", w.Code, w.an.Error)
+	}
+	if d := time.Since(start); d < 10*time.Millisecond {
+		t.Errorf("shed after %v, before queue_timeout", d)
+	}
+	if hits.Load() != 0 {
+		t.Error("shed request reached the backend")
+	}
+}
+
+// TestProxyQueueClientLeaves checks that a client who gives up while queued
+// is logged as having left, and is sent nothing.
+func TestProxyQueueClientLeaves(t *testing.T) {
+	backend, _ := countingBackend(t)
+	sem := limits.NewSemaphore(1, 1)
+	h := newHandler(t, testUpstream(backend.URL), &Route{Concurrency: sem, QueueTimeout: time.Minute}, slog.New(slog.DiscardHandler))
+	sem.TryAcquire()
+	defer sem.Release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &annotatedRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil).WithContext(ctx))
+		close(done)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); sem.Waiting() != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("request never queued")
+		}
+	}
+	cancel()
+	<-done
+	if w.an.Error != "client_closed" || w.Body.Len() != 0 {
+		t.Errorf("got %q with body %q, want client_closed and nothing written", w.an.Error, w.Body)
 	}
 }

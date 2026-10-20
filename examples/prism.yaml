@@ -6,6 +6,14 @@
 trusted_proxies: ["10.0.0.0/8", "127.0.0.1"]
 forwarded_header: false           # also send an RFC 7239 Forwarded header
 
+# Answered on every listener before routing (and not access logged): 200
+# while serving, 503 while draining.
+ready_path: /readyz
+# On SIGTERM: keep serving for drain_delay while ready_path says 503 and
+# HTTP/1 responses ask clients to reconnect, then stop accepting and give
+# active requests up to timeout to finish. A second signal exits at once.
+shutdown: { drain_delay: 5s, timeout: 15s }
+
 listeners:
   - addr: ":8080"
     timeouts: { read_header: 10s, idle: 120s }
@@ -19,10 +27,16 @@ upstreams:
     backends:
       - { url: "http://10.0.0.1:8080", weight: 3 }
       - { url: "https://10.0.0.2:8443", weight: 1, tls: { server_name: api.internal } }
-    # health and circuit_breaker are accepted but ignored (with a warning)
-    # until M3.
+    # Checks every backend with GET path, interval ±10% apart. A backend is
+    # marked down after unhealthy_after failed checks in a row, and up again
+    # after healthy_after passed ones. Any 2xx or 3xx passes.
     health: { path: /healthz, interval: 5s, timeout: 1s, unhealthy_after: 3, healthy_after: 2 }
-    circuit_breaker: { failure_ratio: 0.5, min_requests: 20, open_for: 30s }
+    # Opens when at least min_requests in the last window failed at
+    # failure_ratio or more; after open_for, half_open_probes requests test it.
+    circuit_breaker: { failure_ratio: 0.5, min_requests: 20, open_for: 30s, window: 10s, half_open_probes: 3 }
+    # Ejects a backend after consecutive failures for base_ejection x (times
+    # ejected), up to max_ejection. Never ejects more than the percent cap.
+    outlier: { consecutive_failures: 5, base_ejection: 30s, max_ejection: 300s, max_ejection_percent: 50 }
     timeouts: { connect: 2s, response_header: 10s, idle_conn: 90s }
     max_idle_conns_per_host: 64
 
@@ -39,10 +53,20 @@ routes:
     rate_limit: { per_ip: "100/s", burst: 50 }
     max_body: 10MB                # 413 when larger
     max_concurrency: 500          # in-flight requests; more get 503 + Retry-After: 1
+    # Up to queue_size more wait for a slot for queue_timeout before the 503.
+    queue_size: 100
+    queue_timeout: 1s
     # Retries go only to a backend this request has not tried. connect_error
     # retries any method; timeout and 5xx retry only idempotent ones.
-    # budget_ratio has no effect until M3.
-    retry: { attempts: 2, on: [connect_error, 502, 503], budget_ratio: 0.2 }
+    # Retries in the last 10s are capped at budget_ratio of the requests plus
+    # budget_min_per_sec per second, and retry n waits a random backoff in
+    # [0, min(max, base*2^n)).
+    retry:
+      attempts: 2
+      on: [connect_error, 502, 503]
+      budget_ratio: 0.2
+      budget_min_per_sec: 10
+      backoff: { base: 25ms, max: 250ms }
     cache: { enabled: true, max_object: 1MB }  # ignored (with a warning) until M4
 
   - match: { path_prefix: "/" }

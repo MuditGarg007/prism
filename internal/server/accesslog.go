@@ -71,7 +71,7 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 			status = proxy.StatusClientClosedRequest
 		}
 	}
-	attrs := make([]slog.Attr, 0, 14)
+	attrs := make([]slog.Attr, 0, 15)
 	attrs = append(attrs,
 		slog.String("method", r.Method),
 		slog.String("host", r.Host),
@@ -93,6 +93,9 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 	}
 	if an.Error != "" {
 		attrs = append(attrs, slog.String("error", an.Error))
+	}
+	if an.BudgetExhausted {
+		attrs = append(attrs, slog.Bool("retry_budget_exhausted", true))
 	}
 	if aborted {
 		attrs = append(attrs, slog.Bool("aborted", true))

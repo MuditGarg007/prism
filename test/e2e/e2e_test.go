@@ -41,17 +41,23 @@ routes:
 // listeners, and returns its base URL. It is shut down like startProxy's.
 func startProxyYAML(t *testing.T, body string) string {
 	t.Helper()
+	return startProxyLogged(t, body, t.Output())
+}
+
+// startProxyLogged is startProxyYAML with prism's log written to logs.
+func startProxyLogged(t *testing.T, body string, logs io.Writer) string {
+	t.Helper()
 	yaml := "listeners: [{ addr: \"127.0.0.1:0\" }]\n" + body
 	cfg, err := config.Parse([]byte(yaml), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	log := slog.New(slog.NewTextHandler(t.Output(), nil))
+	log := slog.New(slog.NewTextHandler(logs, nil))
 	rt, err := runtime.Build(cfg, log)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := server.New(cfg.Listeners, runtime.NewCurrent(rt), log)
+	srv, err := server.New(cfg.Listeners, cfg.ReadyPath, runtime.NewCurrent(rt), log)
 	if err != nil {
 		rt.Close()
 		t.Fatal(err)
@@ -60,6 +66,7 @@ func startProxyYAML(t *testing.T, body string) string {
 		rt.Close()
 		t.Fatal(err)
 	}
+	rt.Start()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

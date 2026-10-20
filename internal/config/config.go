@@ -11,6 +11,19 @@ type Config struct {
 	Listeners       []Listener           `yaml:"listeners"`
 	Upstreams       map[string]*Upstream `yaml:"upstreams"`
 	Routes          []Route              `yaml:"routes"`
+	// ReadyPath, when set, is answered on every listener before routing:
+	// 200 while serving, 503 once shutdown has begun.
+	ReadyPath string   `yaml:"ready_path"`
+	Shutdown  Shutdown `yaml:"shutdown"`
+}
+
+type Shutdown struct {
+	// DrainDelay is how long Prism keeps serving, reporting not ready, before
+	// it stops accepting connections, so load balancers in front can notice.
+	DrainDelay time.Duration `yaml:"drain_delay"`
+	// Timeout bounds how long active requests get to finish once Prism stops
+	// accepting connections.
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 type Listener struct {
@@ -47,6 +60,7 @@ type Upstream struct {
 	Backends       []Backend       `yaml:"backends"`
 	Health         *HealthCheck    `yaml:"health"`
 	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker"`
+	Outlier        *Outlier        `yaml:"outlier"`
 	Timeouts       Timeouts        `yaml:"timeouts"`
 	// MaxIdleConnsPerHost caps idle keep-alive connections to each backend.
 	// Go's default of 2 forces new connections under any real concurrency.
@@ -76,6 +90,23 @@ type CircuitBreaker struct {
 	FailureRatio float64       `yaml:"failure_ratio"`
 	MinRequests  int           `yaml:"min_requests"`
 	OpenFor      time.Duration `yaml:"open_for"`
+	// Window is the sliding window that failure_ratio and min_requests are
+	// measured over.
+	Window time.Duration `yaml:"window"`
+	// HalfOpenProbes is how many requests may test a backend at once after
+	// open_for has passed. All must succeed to close the breaker.
+	HalfOpenProbes int `yaml:"half_open_probes"`
+}
+
+// Outlier ejects a backend after consecutive failures, for base_ejection
+// times the number of times it has been ejected, up to max_ejection.
+type Outlier struct {
+	ConsecutiveFailures int           `yaml:"consecutive_failures"`
+	BaseEjection        time.Duration `yaml:"base_ejection"`
+	MaxEjection         time.Duration `yaml:"max_ejection"`
+	// MaxEjectionPercent caps the share of a pool that may be ejected at
+	// once, so a pool is never emptied by ejection alone.
+	MaxEjectionPercent int `yaml:"max_ejection_percent"`
 }
 
 type Timeouts struct {
@@ -93,8 +124,12 @@ type Route struct {
 	RateLimit      *RateLimit `yaml:"rate_limit"`
 	MaxBody        ByteSize   `yaml:"max_body"` // 0 means no limit
 	MaxConcurrency int        `yaml:"max_concurrency"`
-	Retry          *Retry     `yaml:"retry"`
-	Cache          *Cache     `yaml:"cache"`
+	// QueueSize is how many requests may wait for a slot once
+	// max_concurrency is reached, each for up to QueueTimeout.
+	QueueSize    int           `yaml:"queue_size"`
+	QueueTimeout time.Duration `yaml:"queue_timeout"`
+	Retry        *Retry        `yaml:"retry"`
+	Cache        *Cache        `yaml:"cache"`
 }
 
 type Match struct {
@@ -115,9 +150,19 @@ type RateLimit struct {
 }
 
 type Retry struct {
-	Attempts    int      `yaml:"attempts"` // retries after the first try
-	On          []string `yaml:"on"`       // connect_error, timeout, or a 5xx status code
-	BudgetRatio float64  `yaml:"budget_ratio"`
+	Attempts int      `yaml:"attempts"` // retries after the first try
+	On       []string `yaml:"on"`       // connect_error, timeout, or a 5xx status code
+	// Retries may not exceed budget_ratio of recent requests plus
+	// budget_min_per_sec, so retries cannot multiply load in an outage.
+	BudgetRatio     float64 `yaml:"budget_ratio"`
+	BudgetMinPerSec int     `yaml:"budget_min_per_sec"`
+	Backoff         Backoff `yaml:"backoff"`
+}
+
+// Backoff waits a random time in [0, min(max, base*2^n)) before retry n.
+type Backoff struct {
+	Base time.Duration `yaml:"base"`
+	Max  time.Duration `yaml:"max"`
 }
 
 type Cache struct {

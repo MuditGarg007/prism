@@ -19,10 +19,6 @@ import (
 	"github.com/MuditGarg007/prism/internal/server"
 )
 
-// shutdownTimeout bounds how long active requests get to finish on
-// shutdown before their connections are closed.
-const shutdownTimeout = 15 * time.Second
-
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
@@ -71,7 +67,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	defer rt.Close()
 	cur := runtime.NewCurrent(rt)
-	srv, err := server.New(cfg.Listeners, cur, logger)
+	srv, err := server.New(cfg.Listeners, cfg.ReadyPath, cur, logger)
 	if err != nil {
 		fmt.Fprintln(stderr, "prism:", err)
 		return 1
@@ -87,27 +83,68 @@ func run(args []string, stdout, stderr io.Writer) int {
 		"upstreams", len(cfg.Upstreams),
 		"routes", len(cfg.Routes))
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Room for two signals: the first starts a graceful shutdown, and a
+	// second one cuts it short.
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
 
 	if err := srv.Start(); err != nil {
 		logger.Error("cannot listen", "error", err)
 		return 1
 	}
+	rt.Start()
 	logger.Info("prism started", "version", version)
 
 	code := 0
 	select {
-	case <-ctx.Done():
+	case sig := <-sigs:
+		logger.Info("shutting down", "signal", sig.String(),
+			"drain_delay", cfg.Shutdown.DrainDelay, "timeout", cfg.Shutdown.Timeout)
 	case err := <-srv.Err():
 		logger.Error("listener failed", "error", err)
 		code = 1
 	}
-	logger.Info("shutting down", "timeout", shutdownTimeout)
-	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := srv.Shutdown(sctx); err != nil {
+	if err := shutdown(srv, cfg.Shutdown, sigs, logger); err != nil {
 		logger.Warn("shutdown did not finish cleanly", "error", err)
+		code = 1
 	}
 	return code
+}
+
+// errInterrupted is a shutdown cut short by a second signal.
+var errInterrupted = errors.New("interrupted by a second signal")
+
+// shutdown drains srv: it keeps serving for the drain delay while reporting
+// not ready, then stops accepting connections and gives active requests up
+// to the timeout. A signal on sigs during either phase closes everything at
+// once.
+func shutdown(srv *server.Server, sd config.Shutdown, sigs <-chan os.Signal, log *slog.Logger) error {
+	srv.Drain()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	go func() {
+		select {
+		case <-sigs:
+			log.Warn("second signal, closing all connections now")
+			cancel(errInterrupted)
+		case <-ctx.Done():
+		}
+	}()
+
+	if sd.DrainDelay > 0 {
+		t := time.NewTimer(sd.DrainDelay)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+		}
+	}
+	tctx, tcancel := context.WithTimeout(ctx, sd.Timeout)
+	defer tcancel()
+	err := srv.Shutdown(tctx)
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return err
 }

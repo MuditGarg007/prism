@@ -1,6 +1,9 @@
 package resilience
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestRetryable(t *testing.T) {
 	p, err := NewRetry(2, []string{"connect_error", "timeout", "502", "503"})
@@ -83,5 +86,39 @@ func TestRetryableAllocs(t *testing.T) {
 	allocs := testing.AllocsPerRun(100, func() { p.Retryable(Attempt{Status: 503}, Idempotent("GET")) })
 	if allocs != 0 {
 		t.Errorf("Retryable allocates %v times, want 0", allocs)
+	}
+}
+
+func TestDelay(t *testing.T) {
+	p, err := NewRetry(3, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := p.Delay(0); d != 0 {
+		t.Errorf("zero Backoff waits %v", d)
+	}
+	p.Backoff = Backoff{Base: 25 * time.Millisecond, Max: 250 * time.Millisecond}
+	var ceil time.Duration
+	p.randN = func(n time.Duration) time.Duration { ceil = n; return n / 2 }
+	for n, want := range map[int]time.Duration{
+		0:   25 * time.Millisecond,
+		1:   50 * time.Millisecond,
+		3:   200 * time.Millisecond,
+		4:   250 * time.Millisecond, // 400 ms, capped
+		62:  250 * time.Millisecond,
+		100: 250 * time.Millisecond, // no overflow
+	} {
+		if d := p.Delay(n); ceil != want || d != want/2 {
+			t.Errorf("Delay(%d) drew from [0, %v) and gave %v, want [0, %v)", n, ceil, d, want)
+		}
+	}
+
+	// The real random source stays under the ceiling.
+	p, _ = NewRetry(1, nil)
+	p.Backoff = Backoff{Base: time.Millisecond, Max: time.Second}
+	for range 1000 {
+		if d := p.Delay(2); d < 0 || d >= 4*time.Millisecond {
+			t.Fatalf("Delay(2) = %v, outside [0, 4ms)", d)
+		}
 	}
 }
