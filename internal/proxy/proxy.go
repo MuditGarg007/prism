@@ -36,6 +36,7 @@ type Route struct {
 	Concurrency  *limits.Semaphore  // requests served at once; nil for no cap
 	QueueTimeout time.Duration      // longest wait for a Concurrency slot
 	Retry        *resilience.Retry  // nil for no retries
+	Cache        *Cache             // nil when the route does not cache
 }
 
 // Annotations record how the proxy handled one request, for the access log.
@@ -48,6 +49,8 @@ type Annotations struct {
 	// BudgetExhausted is set when a retry was called for but the route's
 	// retry budget refused it.
 	BudgetExhausted bool
+	// Cache is the X-Cache value sent, or "" when the cache was not used.
+	Cache string
 }
 
 // Annotated is implemented by a ResponseWriter that wants Annotations
@@ -113,22 +116,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r.Body = http.MaxBytesReader(w, r.Body, rt.MaxBody)
 		}
 	}
-	if rt.Concurrency != nil {
-		// A full queue or a wait that times out sheds the request, which
-		// pushes back on clients instead of letting latency grow.
-		if err := rt.Concurrency.Acquire(r.Context(), rt.QueueTimeout); err != nil {
-			if r.Context().Err() != nil {
-				h.fail(w, r, rt, nil, an, err) // the client left while queued
-				return
-			}
-			reject(w, an, http.StatusServiceUnavailable, kindOverloaded, time.Second)
-			return
-		}
-		// Held until forward returns, which is after the whole response
-		// body is copied: a slow stream is still load on the backend.
-		defer rt.Concurrency.Release()
+	// The cache comes before the concurrency slot: hits and requests
+	// waiting for another's fetch put no load on a backend, so only a
+	// request that goes to one takes a slot.
+	if c := rt.Cache; c != nil && cacheable(r) {
+		h.serveCache(w, r, rt, c, an)
+		return
 	}
+	if !h.acquire(w, r, rt, an) {
+		return
+	}
+	// Held until forward returns, which is after the whole response body
+	// is copied: a slow stream is still load on the backend.
+	defer release(rt)
 	h.forward(w, r, rt, an)
+}
+
+// acquire takes one of rt's concurrency slots, if it has a limit. If none
+// comes free in time it answers the request and returns false. A full queue
+// or a wait that times out sheds the request, which pushes back on clients
+// instead of letting latency grow.
+func (h *Handler) acquire(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations) bool {
+	if rt.Concurrency == nil {
+		return true
+	}
+	if err := rt.Concurrency.Acquire(r.Context(), rt.QueueTimeout); err != nil {
+		if r.Context().Err() != nil {
+			h.fail(w, r, rt, nil, an, err) // the client left while queued
+			return false
+		}
+		reject(w, an, http.StatusServiceUnavailable, kindOverloaded, time.Second)
+		return false
+	}
+	return true
+}
+
+// release gives back the slot acquire took.
+func release(rt *Route) {
+	if rt.Concurrency != nil {
+		rt.Concurrency.Release()
+	}
 }
 
 // validPath reports whether p is rooted and has no empty, "." or ".."
@@ -150,11 +177,46 @@ func validPath(p string) bool {
 	}
 }
 
+// forward sends r to a backend and streams the response back.
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations) {
+	f, fe := h.fetch(r, rt, an)
+	if fe != nil {
+		h.fetchFailed(w, r, rt, an, fe)
+		return
+	}
+	defer f.release()
+	h.write(w, r, rt, an, &f, f.resp.Body)
+}
+
+// fetched is a backend's response. The backend stays acquired until
+// release.
+type fetched struct {
+	resp *http.Response
+	b    *upstream.Backend
+	adm  upstream.Admission
+	out  resilience.Outcome
+}
+
+func (f *fetched) release() {
+	f.resp.Body.Close()
+	f.b.Release()
+}
+
+// fetchError is why fetch got no response. b is the last backend tried, or
+// nil if none was picked.
+type fetchError struct {
+	b          *upstream.Backend
+	err        error
+	clientBody bool // reading the client's body failed, so it is the client's fault
+}
+
+// fetch sends r to a backend of rt, retrying as the route allows, and
+// returns the response with its hop-by-hop headers removed. It writes
+// nothing to the client, so the caller decides how to answer either way.
+func (h *Handler) fetch(r *http.Request, rt *Route, an *Annotations) (fetched, *fetchError) {
 	body, err := newRequestBody(r, rt.Retry != nil)
 	if err != nil {
-		h.clientBodyFailed(w, r, rt, nil, an, err)
-		return
+		return fetched{}, &fetchError{err: err, clientBody: true}
 	}
 	if p := rt.Retry; p != nil && p.Budget != nil {
 		p.Budget.Request()
@@ -162,8 +224,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 	choice := upstream.Choice{ClientIP: an.ClientIP}
 	b, adm, err := pick(rt.Pool, &choice)
 	if err != nil {
-		h.fail(w, r, rt, nil, an, err)
-		return
+		return fetched{}, &fetchError{err: err}
 	}
 	var (
 		resp *http.Response
@@ -193,25 +254,34 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 		// that is retrying a lot takes on less new work.
 		if !sleep(r.Context(), rt.Retry.Delay(an.Attempts-1)) {
 			b.Report(adm, resilience.Neutral)
-			h.fail(w, r, rt, b, an, r.Context().Err())
-			return
+			return fetched{}, &fetchError{b: b, err: r.Context().Err()}
 		}
 	}
-	defer b.Release()
 	if err != nil {
+		b.Release()
 		// The transport hands back the client's body read error as its own.
 		// Passing max_body is still 413, which fail answers.
 		var mbe *http.MaxBytesError
-		if body.clientFailed() && !errors.As(err, &mbe) {
-			h.clientBodyFailed(w, r, rt, b, an, err)
-			return
-		}
-		h.fail(w, r, rt, b, an, err)
+		return fetched{}, &fetchError{b: b, err: err, clientBody: body.clientFailed() && !errors.As(err, &mbe)}
+	}
+	removeHopByHop(resp.Header)
+	return fetched{resp: resp, b: b, adm: adm, out: out}, nil
+}
+
+// fetchFailed answers a request that fetch got no response for.
+func (h *Handler) fetchFailed(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations, fe *fetchError) {
+	if fe.clientBody {
+		h.clientBodyFailed(w, r, rt, fe.b, an, fe.err)
 		return
 	}
-	defer resp.Body.Close()
+	h.fail(w, r, rt, fe.b, an, fe.err)
+}
 
-	removeHopByHop(resp.Header)
+// write sends f's response to the client, with the route's response header
+// rules applied, reading its body from body: f.resp.Body, or a reader that
+// wraps it.
+func (h *Handler) write(w http.ResponseWriter, r *http.Request, rt *Route, an *Annotations, f *fetched, body io.Reader) {
+	resp := f.resp
 	rt.Response.Apply(resp.Header)
 	wh := w.Header()
 	for k, vv := range resp.Header {
@@ -243,17 +313,17 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 		}
 	}
 
-	readErr, writeErr := copyBody(w, resp.Body, rc)
+	readErr, writeErr := copyBody(w, body, rc)
 	if writeErr != nil {
 		return // the client went away
 	}
 	if readErr != nil {
 		// The headers counted as a success, but the backend failed to send
 		// the body it promised.
-		if out == resilience.Success && r.Context().Err() == nil {
-			b.Overturn(adm)
+		if f.out == resilience.Success && r.Context().Err() == nil {
+			f.b.Overturn(f.adm)
 		}
-		h.abort(r, rt, b, an, readErr)
+		h.abort(r, rt, f.b, an, readErr)
 	}
 	for k, vv := range resp.Trailer {
 		wh[http.TrailerPrefix+k] = vv

@@ -15,6 +15,19 @@ type Config struct {
 	// 200 while serving, 503 once shutdown has begun.
 	ReadyPath string   `yaml:"ready_path"`
 	Shutdown  Shutdown `yaml:"shutdown"`
+	// Cache sizes the response cache that every route with caching enabled
+	// shares.
+	Cache CacheStore `yaml:"cache"`
+	// Admin, when set, serves the admin API on its own listener.
+	Admin *Admin `yaml:"admin"`
+}
+
+type CacheStore struct {
+	MaxSize ByteSize `yaml:"max_size"` // total bytes held, entries and keys included
+}
+
+type Admin struct {
+	Listen string `yaml:"listen"`
 }
 
 type Shutdown struct {
@@ -167,5 +180,15 @@ type Backoff struct {
 
 type Cache struct {
 	Enabled   bool     `yaml:"enabled"`
-	MaxObject ByteSize `yaml:"max_object"`
+	MaxObject ByteSize `yaml:"max_object"` // larger responses are passed through uncached
+	// LockTimeout is how long a request waits for another request's fetch
+	// of the same key before it fetches for itself.
+	LockTimeout time.Duration `yaml:"lock_timeout"`
+	// BypassHeader names a request header that, when present, skips the
+	// lookup. The response may still be stored. Empty turns bypassing off.
+	BypassHeader string `yaml:"bypass_header"`
+	// StaleIfError caps how long past its freshness an entry may be served
+	// when the backend fails. A response's stale-if-error is also capped by
+	// it, so 0 never serves stale entries.
+	StaleIfError time.Duration `yaml:"stale_if_error"`
 }

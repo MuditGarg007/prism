@@ -55,14 +55,19 @@ accept → TLS (SNI cert pick)
   → auth (basic / API key)
   → rate limit (per-IP, per-route)          → 429 + Retry-After
   → request size check                       → 413
-  → concurrency limit / bounded queue        → 503 + Retry-After
   → cache lookup (+ coalescing)              → HIT returns here
+  → concurrency limit / bounded queue        → 503 + Retry-After
   → traffic split (canary) / shadow copy
   → balancer pick (skips unhealthy / ejected / breaker-open)
   → forward with deadline, retries, budget
   → cache store (tee body)
   → metrics + log finish
 ```
+
+The cache lookup comes before the concurrency limit, so hits and requests
+waiting on a coalesced fetch never hold a slot. Only the request that goes to
+a backend, a miss or a revalidation, takes one. Otherwise cheap hits, and
+hundreds of waiters on one cold key, would starve real work.
 
 ## Key abstractions
 
@@ -117,6 +122,9 @@ routes:
     max_concurrency: 500
     retry: { attempts: 2, on: [connect_error, 502, 503], budget_ratio: 0.2 }
     cache: { enabled: true, max_object: 1MB }
+
+cache: { max_size: 64MB }      # one store shared by every route
+admin: { listen: "127.0.0.1:9901" }
 ```
 
 ## Milestones
@@ -178,9 +186,17 @@ Build these together.
 - Revalidate with `If-None-Match`/`If-Modified-Since`, and merge headers from a 304 into the stored entry.
 - A byte-bounded LRU (a map plus a doubly linked list, written by hand). Tee the body into the cache while streaming it to the client, and abandon caching if it exceeds `max_object`.
 - A hand-written singleflight for coalescing: one upstream fetch, N waiters.
-- Purge goes through the admin API. Add a bypass header, metrics for hit/miss/stale/revalidated, and an `X-Cache` response header.
+- Purge goes through the admin API, so the admin listener (`admin: { listen }`, loopback by default) arrives here with `POST /cache/purge` and `GET /cache/stats`; M5 adds the rest of its endpoints. Add a bypass header, metrics for hit/miss/stale/revalidated, and an `X-Cache` response header.
 
 **Exit:** a coalescing test where 1,000 concurrent requests for a cold key produce exactly 1 upstream hit.
+
+**Status:** done on 2026-10-20. The decisions and details are in `docs/m4-handoff.md`. As built:
+
+- Every cached response carries `X-Cache`: `HIT`, `MISS`, `STALE`, `REVALIDATED` or `BYPASS`. The access log has the same value as `cache=`, and `GET /cache/stats` on the admin listener counts each one, along with the store's entries, bytes and evictions and the requests waiting on a fetch.
+- Coalescing follows nginx's `proxy_cache_lock`: one request fetches a cold or stale key and the rest wait up to `lock_timeout`, then fetch for themselves without storing. A response that can't be stored releases the waiters at once and marks the key **hit-for-pass** for 10 s, as Varnish does, so requests for an uncacheable URL never queue behind each other.
+- **Stale-if-error:** when the backend fails (a connect error, a timeout or any 5xx), an entry up to the route's `stale_if_error` past its freshness is served as `STALE`. A response's own `stale-if-error` can narrow that window but never widen it. `must-revalidate`, `no-cache` and `s-maxage` forbid it. Requests waiting on a failed fetch serve the stale entry too, rather than each trying the backend. `stale-while-revalidate` is parsed but not acted on yet.
+- `POST /cache/purge` with `{"host", "path", "prefix"}` deletes every variant, method and scheme of a URL, or of every URL under a path prefix. The host is matched without case or default port, and the path must start with `/`.
+- The admin listener has no authentication. Prism warns at startup when `admin.listen` is not a loopback address.
 
 ### M5: Operations, first part of Layer 5 (1.5 weeks)
 

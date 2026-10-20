@@ -48,6 +48,32 @@ func (c *Config) validateLifecycle(p *problems) {
 		p.add("shutdown.drain_delay", "must not be negative, got %v", c.Shutdown.DrainDelay)
 	}
 	checkPositive(p, "shutdown.timeout", c.Shutdown.Timeout)
+	if a := c.Admin; a != nil {
+		if err := checkAddr(a.Listen); err != nil {
+			p.add("admin.listen", "%v", err)
+		}
+		for i, l := range c.Listeners {
+			if l.Addr == a.Listen {
+				p.add("admin.listen", "same address as listeners[%d]", i)
+			}
+		}
+	}
+}
+
+// checkAddr checks a listen address of the form "host:port", where the host
+// may be empty.
+func checkAddr(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("is required")
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid address %q: %v", addr, err)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("invalid port %q", port)
+	}
+	return nil
 }
 
 func (c *Config) validateListeners(p *problems) {
@@ -57,12 +83,8 @@ func (c *Config) validateListeners(p *problems) {
 	seen := map[string]bool{}
 	for i, l := range c.Listeners {
 		path := fmt.Sprintf("listeners[%d]", i)
-		if l.Addr == "" {
-			p.add(path+".addr", "is required")
-		} else if _, port, err := net.SplitHostPort(l.Addr); err != nil {
-			p.add(path+".addr", "invalid address %q: %v", l.Addr, err)
-		} else if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
-			p.add(path+".addr", "invalid port %q", port)
+		if err := checkAddr(l.Addr); err != nil {
+			p.add(path+".addr", "%v", err)
 		}
 		if seen[l.Addr] {
 			p.add(path+".addr", "duplicate listener address %q", l.Addr)
@@ -240,6 +262,29 @@ func (c *Config) validateRoutes(p *problems) {
 		if rt := r.Retry; rt != nil {
 			validateRetry(p, path+".retry", rt)
 		}
+		if ca := r.Cache; ca != nil {
+			validateCache(p, path+".cache", ca, c.Cache.MaxSize)
+		}
+	}
+}
+
+func validateCache(p *problems, path string, ca *Cache, maxSize ByteSize) {
+	// Sizes cannot be negative and 0 takes the default, so only the upper
+	// bound needs checking.
+	if ca.MaxObject > maxSize {
+		p.add(path+".max_object", "must not exceed cache.max_size (%d), got %d", maxSize, ca.MaxObject)
+	}
+	checkPositive(p, path+".lock_timeout", ca.LockTimeout)
+	if h := ca.BypassHeader; h != "" {
+		switch {
+		case !isToken(h):
+			p.add(path+".bypass_header", "invalid header name %q", h)
+		case slices.Contains(hopByHop, strings.ToLower(h)):
+			p.add(path+".bypass_header", "%q is a hop-by-hop header, meant for the connection only", h)
+		}
+	}
+	if ca.StaleIfError < 0 {
+		p.add(path+".stale_if_error", "must not be negative, got %v", ca.StaleIfError)
 	}
 }
 

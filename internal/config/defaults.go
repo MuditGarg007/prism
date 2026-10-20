@@ -32,12 +32,15 @@ const (
 	defaultBackoffMax            = 250 * time.Millisecond
 	defaultShutdownTimeout       = 15 * time.Second
 	defaultMaxCacheObject        = 1 << 20
+	defaultCacheMaxSize          = 64 << 20
+	defaultCacheLockTimeout      = 5 * time.Second
 )
 
 // applyDefaults fills zero values only, so invalid input such as a negative
 // weight is left for validate to report.
 func (c *Config) applyDefaults() {
 	setDefault(&c.Shutdown.Timeout, defaultShutdownTimeout)
+	setDefault(&c.Cache.MaxSize, defaultCacheMaxSize)
 	for i := range c.Listeners {
 		t := &c.Listeners[i].Timeouts
 		setDefault(&t.ReadHeader, defaultReadHeaderTimeout)
@@ -96,6 +99,7 @@ func (c *Config) applyDefaults() {
 		}
 		if ca := r.Cache; ca != nil {
 			setDefault(&ca.MaxObject, defaultMaxCacheObject)
+			setDefault(&ca.LockTimeout, defaultCacheLockTimeout)
 		}
 	}
 }

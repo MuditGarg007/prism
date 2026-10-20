@@ -399,3 +399,51 @@ func TestServerShutdownHijacked(t *testing.T) {
 		}
 	})
 }
+
+// TestServerAdmin checks that the admin listener serves its own handler,
+// skips the ready path and the access log, and shuts down with the rest.
+func TestServerAdmin(t *testing.T) {
+	logs, log := newTestLogger()
+	s, err := New([]config.Listener{plainListener()}, "/ready", http.NotFoundHandler(), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.AdminAddr() != nil {
+		t.Error("AdminAddr before Admin is not nil")
+	}
+	s.Admin("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "admin "+r.URL.Path)
+	}))
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(s.Addrs()); n != 2 {
+		t.Fatalf("%d addrs, want 2", n)
+	}
+	if s.AdminAddr() != s.Addrs()[1] {
+		t.Errorf("AdminAddr %v is not the last address %v", s.AdminAddr(), s.Addrs()[1])
+	}
+	base := "http://" + s.AdminAddr().String()
+	for _, path := range []string{"/cache/stats", "/ready"} {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != "admin "+path {
+			t.Errorf("%s: %q", path, body)
+		}
+	}
+	if out := logs.waitFor(t, "admin API listening"); !strings.Contains(out, "admin API listening") || strings.Contains(out, "/cache/stats") {
+		t.Errorf("logs: %q", out)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := http.Get(base + "/cache/stats"); err == nil {
+		t.Error("admin listener still serving after Shutdown")
+	}
+}

@@ -84,6 +84,22 @@ func TestParseDefaults(t *testing.T) {
 	if r := cfg.Routes[0]; r.QueueSize != 0 || r.QueueTimeout != 0 {
 		t.Errorf("queue_size = %d, queue_timeout = %v, want both zero", r.QueueSize, r.QueueTimeout)
 	}
+	if cfg.Cache.MaxSize != defaultCacheMaxSize || cfg.Admin != nil || cfg.Routes[0].Cache != nil {
+		t.Errorf("cache = %+v, admin = %+v, route cache = %+v, want default size, no admin and no route cache",
+			cfg.Cache, cfg.Admin, cfg.Routes[0].Cache)
+	}
+}
+
+func TestParseCacheDefaults(t *testing.T) {
+	in := strings.Replace(minimal, "upstream: web }", "upstream: web, cache: { enabled: true } }", 1)
+	cfg, err := Parse([]byte(in), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Cache{Enabled: true, MaxObject: defaultMaxCacheObject, LockTimeout: defaultCacheLockTimeout}
+	if got := *cfg.Routes[0].Cache; got != want {
+		t.Errorf("cache = %+v, want %+v", got, want)
+	}
 }
 
 func TestParseResilienceDefaults(t *testing.T) {
@@ -173,6 +189,14 @@ func TestParseErrors(t *testing.T) {
 		{"negative queue timeout", `upstream: web }`, `upstream: web, max_concurrency: 1, queue_size: 1, queue_timeout: -1s }`, "queue_timeout: must be positive"},
 		{"negative budget floor", `upstream: web }`, `upstream: web, retry: { attempts: 1, budget_min_per_sec: -1 } }`, "retry.budget_min_per_sec: must be at least 1"},
 		{"backoff max below base", `upstream: web }`, `upstream: web, retry: { attempts: 1, backoff: { base: 1s, max: 10ms } } }`, "retry.backoff.max: must be at least backoff.base"},
+		{"max object over store", `upstream: web }`, `upstream: web, cache: { enabled: true, max_object: 128MB } }`, "cache.max_object: must not exceed cache.max_size"},
+		{"negative lock timeout", `upstream: web }`, `upstream: web, cache: { enabled: true, lock_timeout: -1s } }`, "cache.lock_timeout: must be positive"},
+		{"bad bypass header", `upstream: web }`, `upstream: web, cache: { enabled: true, bypass_header: "X Bypass" } }`, `cache.bypass_header: invalid header name "X Bypass"`},
+		{"hop-by-hop bypass header", `upstream: web }`, `upstream: web, cache: { enabled: true, bypass_header: TE } }`, `cache.bypass_header: "TE" is a hop-by-hop header`},
+		{"negative stale if error", `upstream: web }`, `upstream: web, cache: { enabled: true, stale_if_error: -1s } }`, "cache.stale_if_error: must not be negative"},
+		{"admin without port", "listeners:", "admin: { listen: localhost }\nlisteners:", "admin.listen: invalid address"},
+		{"admin missing listen", "listeners:", "admin: {}\nlisteners:", "admin.listen: is required"},
+		{"admin on listener address", "listeners:", "admin: { listen: \":8080\" }\nlisteners:", "admin.listen: same address as listeners[0]"},
 		{"negative max idle conns", "    backends:", "    max_idle_conns_per_host: -1\n    backends:", "upstreams.web.max_idle_conns_per_host: must be at least 1"},
 	}
 	for _, tt := range tests {

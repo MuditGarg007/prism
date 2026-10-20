@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MuditGarg007/prism/internal/admin"
 	"github.com/MuditGarg007/prism/internal/config"
 	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/runtime"
@@ -71,6 +72,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "prism:", err)
 		return 1
+	}
+	if a := cfg.Admin; a != nil {
+		srv.Admin(a.Listen, admin.New(cur, logger))
 	}
 	if *validateOnly {
 		fmt.Fprintf(stdout, "configuration %s is valid\n", *configPath)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,21 +76,115 @@ func TestBuildExample(t *testing.T) {
 	if len(rt.Pools) != 2 || len(rt.Pools["api"].Backends) != 2 {
 		t.Errorf("pools = %v", rt.Pools)
 	}
-	out := logs.String()
-	for _, want := range []string{
-		"option=routes[0].cache",
+	// The example's admin API is on loopback, and everything it sets is
+	// implemented, so Build has nothing to warn about.
+	if out := logs.String(); out != "" {
+		t.Errorf("warnings: %q", out)
+	}
+	if rt.Cache == nil || rt.Cache.MaxSize != 64<<20 {
+		t.Errorf("cache = %+v, want a 64 MB store", rt.Cache)
+	}
+}
+
+func TestBuildAdminWarning(t *testing.T) {
+	for _, tt := range []struct {
+		listen string
+		warn   bool
+	}{
+		{"127.0.0.1:9901", false},
+		{"[::1]:9901", false},
+		{"localhost:9901", false},
+		{":9901", true},
+		{"0.0.0.0:9901", true},
+		{"10.0.0.1:9901", true},
 	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("warnings %q do not mention %s", out, want)
+		cfg := singleUpstream(t, "http://127.0.0.1:9000")
+		cfg.Admin = &config.Admin{Listen: tt.listen}
+		var logs bytes.Buffer
+		rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt.Close()
+		if got := strings.Contains(logs.String(), "beyond loopback"); got != tt.warn {
+			t.Errorf("%s: warned %v, want %v: %q", tt.listen, got, tt.warn, logs.String())
 		}
 	}
-	for _, done := range []string{"rate_limit", "max_body", "max_concurrency", "retry", "circuit_breaker", "outlier", "health"} {
-		if strings.Contains(out, done) {
-			t.Errorf("warned about %s, which is implemented: %q", done, out)
+}
+
+// TestBuildCache checks that only routes with caching enabled cache, that
+// they share one store, and that bypass_header matches whatever its case.
+func TestBuildCache(t *testing.T) {
+	var hits atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Cache-Control", "max-age=60")
+		io.WriteString(w, r.URL.Path)
+	}))
+	defer s.Close()
+	rt := build(t, parse(t, fmt.Sprintf(`
+listeners: [{ addr: ":8080" }]
+cache: { max_size: 1MB }
+upstreams:
+  web: { backends: [{ url: %q }] }
+routes:
+  - { match: { path_prefix: /a/ }, upstream: web, cache: { enabled: true, bypass_header: x-no-cache } }
+  - { match: { path_prefix: /b/ }, upstream: web, cache: { enabled: true } }
+  - { match: { path_prefix: /off/ }, upstream: web, cache: { enabled: false } }
+  - { match: { path_prefix: / }, upstream: web }
+`, s.URL), ""))
+	if rt.Cache == nil || rt.Cache.MaxSize != 1<<20 {
+		t.Fatalf("cache = %+v", rt.Cache)
+	}
+
+	serve := func(path string, h http.Header) string {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", path, nil)
+		maps.Copy(req.Header, h)
+		rt.Handler.ServeHTTP(rec, req)
+		return rec.Header().Get("X-Cache")
+	}
+	tests := []struct {
+		path   string
+		header http.Header
+		want   []string // X-Cache of two requests in a row
+		hits   int64    // backend requests they make
+	}{
+		{"/a/x", nil, []string{"MISS", "HIT"}, 1},
+		{"/b/x", nil, []string{"MISS", "HIT"}, 1},
+		{"/a/x", http.Header{"X-No-Cache": {"1"}}, []string{"BYPASS", "BYPASS"}, 2},
+		{"/off/x", nil, []string{"", ""}, 2},
+		{"/x", nil, []string{"", ""}, 2},
+	}
+	for _, tt := range tests {
+		before := hits.Load()
+		for i, want := range tt.want {
+			if got := serve(tt.path, tt.header); got != want {
+				t.Errorf("%s %v request %d: X-Cache %q, want %q", tt.path, tt.header, i, got, want)
+			}
+		}
+		if n := hits.Load() - before; n != tt.hits {
+			t.Errorf("%s %v: %d backend requests, want %d", tt.path, tt.header, n, tt.hits)
 		}
 	}
-	if strings.Contains(out, "routes[1]") || strings.Contains(out, "upstreams.static") {
-		t.Errorf("warned about options that are not set: %q", out)
+	if st := rt.Cache.Store.Stats(); st.Entries != 2 {
+		t.Errorf("store holds %d entries, want 2", st.Entries)
+	}
+	if n := rt.Cache.Stats.Snapshot(); n.Hit != 2 || n.Miss != 2 || n.Bypass != 2 {
+		t.Errorf("stats = %+v", n)
+	}
+}
+
+func TestBuildNoCache(t *testing.T) {
+	cfg := parse(t, `
+listeners: [{ addr: ":8080" }]
+upstreams:
+  web: { backends: [{ url: "http://127.0.0.1:9000" }] }
+routes:
+  - { match: { path_prefix: / }, upstream: web, cache: { enabled: false } }
+`, "")
+	if rt := build(t, cfg); rt.Cache != nil {
+		t.Errorf("built a cache no route uses: %+v", rt.Cache)
 	}
 }
 

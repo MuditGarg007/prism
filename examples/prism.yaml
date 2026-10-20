@@ -14,6 +14,13 @@ ready_path: /readyz
 # active requests up to timeout to finish. A second signal exits at once.
 shutdown: { drain_delay: 5s, timeout: 15s }
 
+# One response cache shared by every route with caching enabled, bounded by
+# max_size bytes (least recently used entries go first).
+cache: { max_size: 64MB }
+# Admin API on its own listener: POST /cache/purge, GET /cache/stats. Keep
+# it on loopback; it has no authentication.
+admin: { listen: "127.0.0.1:9901" }
+
 listeners:
   - addr: ":8080"
     timeouts: { read_header: 10s, idle: 120s }
@@ -67,7 +74,18 @@ routes:
       budget_ratio: 0.2
       budget_min_per_sec: 10
       backoff: { base: 25ms, max: 250ms }
-    cache: { enabled: true, max_object: 1MB }  # ignored (with a warning) until M4
+    # Caches GET responses that say how long they stay fresh. Larger than
+    # max_object passes through uncached. Requests for a key being fetched
+    # wait up to lock_timeout for it, then fetch for themselves. When the
+    # backend fails, an entry up to stale_if_error past its freshness is
+    # served instead (X-Cache: STALE). Requests carrying bypass_header skip
+    # the lookup, but their response is still stored.
+    cache:
+      enabled: true
+      max_object: 1MB
+      lock_timeout: 5s
+      stale_if_error: 30s
+      bypass_header: X-Cache-Bypass
 
   - match: { path_prefix: "/" }
     upstream: static

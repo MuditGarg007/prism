@@ -71,7 +71,7 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 			status = proxy.StatusClientClosedRequest
 		}
 	}
-	attrs := make([]slog.Attr, 0, 15)
+	attrs := make([]slog.Attr, 0, 16)
 	attrs = append(attrs,
 		slog.String("method", r.Method),
 		slog.String("host", r.Host),
@@ -90,6 +90,9 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 	}
 	if an.Backend != nil {
 		attrs = append(attrs, slog.String("backend", an.Backend.String()), slog.Int("attempts", an.Attempts))
+	}
+	if an.Cache != "" {
+		attrs = append(attrs, slog.String("cache", an.Cache))
 	}
 	if an.Error != "" {
 		attrs = append(attrs, slog.String("error", an.Error))

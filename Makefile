@@ -31,6 +31,7 @@ fuzz:
 	go test -run='^$$' -fuzz=FuzzGCRA -fuzztime=30s ./internal/ratelimit
 	go test -run='^$$' -fuzz=FuzzWindow -fuzztime=30s ./internal/resilience
 	go test -run='^$$' -fuzz=FuzzBudget -fuzztime=30s ./internal/resilience
+	go test -run='^$$' -fuzz=FuzzCacheControl -fuzztime=30s ./internal/cache
 
 validate: build
 	./bin/prism -config examples/prism.yaml -validate

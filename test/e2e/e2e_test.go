@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MuditGarg007/prism/internal/admin"
 	"github.com/MuditGarg007/prism/internal/config"
 	"github.com/MuditGarg007/prism/internal/runtime"
 	"github.com/MuditGarg007/prism/internal/server"
@@ -47,6 +48,13 @@ func startProxyYAML(t *testing.T, body string) string {
 // startProxyLogged is startProxyYAML with prism's log written to logs.
 func startProxyLogged(t *testing.T, body string, logs io.Writer) string {
 	t.Helper()
+	return "http://" + launch(t, body, logs).Addrs()[0].String()
+}
+
+// launch runs prism from body, as main does, with its admin API when body
+// configures one. It is shut down like startProxy's.
+func launch(t *testing.T, body string, logs io.Writer) *server.Server {
+	t.Helper()
 	yaml := "listeners: [{ addr: \"127.0.0.1:0\" }]\n" + body
 	cfg, err := config.Parse([]byte(yaml), "")
 	if err != nil {
@@ -57,10 +65,14 @@ func startProxyLogged(t *testing.T, body string, logs io.Writer) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := server.New(cfg.Listeners, cfg.ReadyPath, runtime.NewCurrent(rt), log)
+	cur := runtime.NewCurrent(rt)
+	srv, err := server.New(cfg.Listeners, cfg.ReadyPath, cur, log)
 	if err != nil {
 		rt.Close()
 		t.Fatal(err)
+	}
+	if a := cfg.Admin; a != nil {
+		srv.Admin(a.Listen, admin.New(cur, log))
 	}
 	if err := srv.Start(); err != nil {
 		rt.Close()
@@ -75,7 +87,7 @@ func startProxyLogged(t *testing.T, body string, logs io.Writer) string {
 		}
 		rt.Close()
 	})
-	return "http://" + srv.Addrs()[0].String()
+	return srv
 }
 
 // startBackend runs h on a loopback server that is closed when the test

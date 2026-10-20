@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/netip"
 	"slices"
 	"sync/atomic"
 
 	"github.com/MuditGarg007/prism/internal/balancer"
+	"github.com/MuditGarg007/prism/internal/cache"
 	"github.com/MuditGarg007/prism/internal/config"
 	"github.com/MuditGarg007/prism/internal/health"
 	"github.com/MuditGarg007/prism/internal/limits"
@@ -29,15 +31,41 @@ type Runtime struct {
 	Config  *config.Config
 	Handler *proxy.Handler
 	Pools   map[string]*upstream.Pool
+	// Cache is shared by every route that caches, or nil when none does.
+	Cache *Cache
 
 	checkers []*health.Checker // started by Start
 }
+
+// Cache is the response cache that every caching route shares. The admin
+// API reads and purges it.
+type Cache struct {
+	Store   *cache.Store
+	Flight  *cache.Flight
+	Stats   *cache.Stats
+	MaxSize int64 // the Store's byte budget, cache.max_size
+}
+
+func caches(r config.Route) bool { return r.Cache != nil && r.Cache.Enabled }
 
 // Build creates the pools, routes and handler for cfg, which must already be
 // validated. It fails on problems that validation cannot see, such as a CA
 // file that holds no certificates.
 func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 	rt := &Runtime{Config: cfg, Pools: make(map[string]*upstream.Pool, len(cfg.Upstreams))}
+	if a := cfg.Admin; a != nil && !loopback(a.Listen) {
+		log.Warn("admin API listens beyond loopback and has no authentication", "addr", a.Listen)
+	}
+	// One store for the whole process, built only when some route uses it.
+	if slices.ContainsFunc(cfg.Routes, caches) {
+		size := int64(cfg.Cache.MaxSize)
+		rt.Cache = &Cache{
+			Store:   cache.NewStore(size),
+			Flight:  cache.NewFlight(),
+			Stats:   &cache.Stats{},
+			MaxSize: size,
+		}
+	}
 
 	// Sorted, so warnings and errors come out in the same order every time.
 	for _, name := range slices.Sorted(maps.Keys(cfg.Upstreams)) {
@@ -66,9 +94,6 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 			rt.Close()
 			return nil, fmt.Errorf("routes[%d]: unknown upstream %q", i, r.Upstream)
 		}
-		warnIgnored(log, fmt.Sprintf("routes[%d]", i), map[string]bool{
-			"cache": r.Cache != nil,
-		})
 		h := r.Headers
 		var limiter *ratelimit.Limiter
 		if rl := r.RateLimit; rl != nil {
@@ -83,6 +108,19 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 			}
 			retry.Backoff = resilience.Backoff{Base: rc.Backoff.Base, Max: rc.Backoff.Max}
 			retry.Budget = resilience.NewBudget(rc.BudgetRatio, rc.BudgetMinPerSec)
+		}
+		var pc *proxy.Cache
+		if caches(r) {
+			c := r.Cache
+			pc = &proxy.Cache{
+				Store:        rt.Cache.Store,
+				Flight:       rt.Cache.Flight,
+				Stats:        rt.Cache.Stats,
+				MaxObject:    int64(c.MaxObject),
+				LockTimeout:  c.LockTimeout,
+				BypassHeader: http.CanonicalHeaderKey(c.BypassHeader),
+				StaleIfError: c.StaleIfError,
+			}
 		}
 		var sem *limits.Semaphore
 		if r.MaxConcurrency > 0 {
@@ -104,6 +142,7 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 				Concurrency:  sem,
 				QueueTimeout: r.QueueTimeout,
 				Retry:        retry,
+				Cache:        pc,
 			},
 		})
 	}
@@ -121,18 +160,18 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 	return rt, nil
 }
 
-// warnIgnored warns about each config feature in set that is present but not
-// implemented yet, so that a feature such as a cache is never silently
-// unenforced.
-func warnIgnored(log *slog.Logger, path string, set map[string]bool) {
-	for _, name := range slices.Sorted(maps.Keys(set)) {
-		if set[name] {
-			if path != "" {
-				name = path + "." + name
-			}
-			log.Warn("config option is not implemented yet and is ignored", "option", name)
-		}
+// loopback reports whether addr only accepts connections from this host.
+// An empty host listens on every interface.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
 	}
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }
 
 // Start starts the background work of rt, which is active health checking.

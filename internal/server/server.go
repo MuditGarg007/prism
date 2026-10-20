@@ -27,6 +27,7 @@ type Server struct {
 	errc     chan error
 	draining atomic.Bool
 	hijacked connSet
+	admin    bool // the last server is the admin API
 }
 
 // New prepares a server for each listener and loads their certificates.
@@ -62,6 +63,20 @@ func New(listeners []config.Listener, readyPath string, h http.Handler, log *slo
 	return s, nil
 }
 
+// Admin adds a listener on addr that serves h, the admin API. It skips the
+// access log and the ready path, and shuts down with the other listeners.
+// It must be called at most once, before Start.
+func (s *Server) Admin(addr string, h http.Handler) {
+	s.servers = append(s.servers, &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
+	})
+	s.errc = make(chan error, len(s.servers))
+	s.admin = true
+}
+
 // Start binds every listener, then serves them in the background. Binding
 // all of them first means a port that is in use fails Start before any
 // traffic is accepted. Errors from serving arrive on Err.
@@ -80,7 +95,11 @@ func (s *Server) Start() error {
 	}
 	for i, srv := range s.servers {
 		isTLS := srv.TLSConfig != nil
-		s.log.Info("listening", "addr", lns[i].Addr().String(), "tls", isTLS)
+		if s.admin && i == len(s.servers)-1 {
+			s.log.Info("admin API listening", "addr", lns[i].Addr().String())
+		} else {
+			s.log.Info("listening", "addr", lns[i].Addr().String(), "tls", isTLS)
+		}
 		go func() {
 			var err error
 			if isTLS {
@@ -98,8 +117,18 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Addrs returns the bound addresses, in listener order, after Start.
+// Addrs returns the bound addresses, in listener order and then the admin
+// API's, after Start.
 func (s *Server) Addrs() []net.Addr { return s.addrs }
+
+// AdminAddr returns the admin API's bound address after Start, or nil when
+// there is none.
+func (s *Server) AdminAddr() net.Addr {
+	if !s.admin || len(s.addrs) == 0 {
+		return nil
+	}
+	return s.addrs[len(s.addrs)-1]
+}
 
 // Err delivers errors that stop a listener from serving.
 func (s *Server) Err() <-chan error { return s.errc }
