@@ -1,8 +1,20 @@
 # Example Prism config. Check it with:
 #   prism -config examples/prism.yaml -validate
+#
+# SIGHUP (or POST /reload on the admin API) reloads this file without
+# dropping a request: it is parsed, validated and built, then swapped in,
+# and requests already running finish on the old config. A config that
+# fails any step is logged and the old one keeps serving. Backends keep
+# their health, breaker, inflight count and pooled connections, routes
+# their rate limits, concurrency slots and retry budgets, and the cache its
+# entries, each while its settings are unchanged. Certificate files are
+# re-read. listeners, admin, shutdown and ready_path need a restart; a
+# reload warns about changes to them and leaves them as they were.
 
-# Peers whose X-Forwarded-* headers are trusted (for example a load balancer
-# in front of Prism). From anyone else, those headers are replaced.
+# Peers whose X-Forwarded-* and X-Request-Id headers are trusted (for
+# example a load balancer in front of Prism). From anyone else, those
+# headers are replaced: every request gets a new X-Request-Id, sent to the
+# backend and the client and logged as request_id.
 trusted_proxies: ["10.0.0.0/8", "127.0.0.1"]
 forwarded_header: false           # also send an RFC 7239 Forwarded header
 
@@ -17,8 +29,10 @@ shutdown: { drain_delay: 5s, timeout: 15s }
 # One response cache shared by every route with caching enabled, bounded by
 # max_size bytes (least recently used entries go first).
 cache: { max_size: 64MB }
-# Admin API on its own listener: POST /cache/purge, GET /cache/stats. Keep
-# it on loopback; it has no authentication.
+# Admin API on its own listener: GET /metrics (Prometheus), GET /routes,
+# GET /upstreams (live health, inflight and breaker state), GET /config (the
+# effective config, URL passwords masked), POST /reload, POST /cache/purge
+# and GET /cache/stats. Keep it on loopback; it has no authentication.
 admin: { listen: "127.0.0.1:9901" }
 
 listeners:

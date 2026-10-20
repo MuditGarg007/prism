@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 
-.PHONY: all build test vet staticcheck lint bench fuzz validate chaos clean
+.PHONY: all build test vet staticcheck lint bench fuzz validate chaos reload clean
 
 all: lint test
 
@@ -40,6 +40,10 @@ validate: build
 chaos:
 	scripts/chaos/kill-backend.sh
 	scripts/chaos/outage.sh
+
+# About 25 s: SIGHUP every 0.25 s under load, failing on any error.
+reload:
+	scripts/reload-under-load.sh
 
 clean:
 	rm -rf bin

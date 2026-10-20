@@ -208,7 +208,7 @@ routes:
 		t.Fatal(err)
 	}
 	logs, log := newTestLogger()
-	rt, err := runtime.Build(cfg, log)
+	rt, err := runtime.Build(cfg, log, runtime.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,6 +218,7 @@ routes:
 	req, _ := http.NewRequest("GET", urls[0]+"/v1/users?secret=1", nil)
 	req.Host = "api.test"
 	req.Header.Set("X-Forwarded-For", "203.0.113.9")
+	req.Header.Set("X-Request-Id", "edge-42") // kept from a trusted peer
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -227,7 +228,7 @@ routes:
 
 	out := logs.waitFor(t, "msg=request")
 	for _, want := range []string{
-		"method=GET", "host=api.test", "path=/v1/users ", "proto=HTTP/1.1",
+		"request_id=edge-42", "method=GET", "host=api.test", "path=/v1/users ", "proto=HTTP/1.1",
 		"status=201", "bytes=5", "duration=",
 		"client=203.0.113.9", // the peer is trusted, so its X-Forwarded-For is used
 		"route=api.test/v1/", "upstream=api", "backend=" + backend.URL, "attempts=1",

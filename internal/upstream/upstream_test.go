@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +52,7 @@ func TestNewPool(t *testing.T) {
 		config.Backend{URL: "http://127.0.0.1:9000", Weight: 3},
 		config.Backend{URL: "https://10.0.0.2:8443", Weight: 1},
 	)
-	p, err := NewPool("api", u, newFirst, slog.New(slog.DiscardHandler))
+	p, err := NewPool("api", u, newFirst, slog.New(slog.DiscardHandler), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +98,7 @@ func TestNewPool(t *testing.T) {
 }
 
 func TestBackendInflight(t *testing.T) {
-	var b Backend
+	b := NewBackend(nil, 1)
 	var wg sync.WaitGroup
 	for range 100 {
 		wg.Go(func() {
@@ -113,9 +114,9 @@ func TestBackendInflight(t *testing.T) {
 }
 
 func TestBackendHealth(t *testing.T) {
-	var b Backend
+	b := NewBackend(nil, 1)
 	if !b.Available() {
-		t.Fatal("zero Backend must be available")
+		t.Fatal("new Backend must be available")
 	}
 	b.SetHealthy(false)
 	if b.Available() {
@@ -146,7 +147,7 @@ func TestPoolResilience(t *testing.T) {
 	}
 	newPool := func(u *config.Upstream) (*Pool, *strings.Builder) {
 		var logs strings.Builder
-		p, err := NewPool("api", u, newFirst, slog.New(slog.NewTextHandler(&logs, nil)))
+		p, err := NewPool("api", u, newFirst, slog.New(slog.NewTextHandler(&logs, nil)), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -205,7 +206,7 @@ func TestPoolResilience(t *testing.T) {
 }
 
 func TestChoiceUsable(t *testing.T) {
-	up, down, tried := &Backend{}, &Backend{}, &Backend{}
+	up, down, tried := NewBackend(nil, 1), NewBackend(nil, 1), NewBackend(nil, 1)
 	down.SetHealthy(false)
 	c := Choice{Tried: []*Backend{tried}}
 	for _, tt := range []struct {
@@ -254,7 +255,7 @@ func TestBackendTLS(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := NewPool("tls", testUpstream(config.Backend{URL: srv.URL, Weight: 1, TLS: tt.tls}), newFirst, slog.New(slog.DiscardHandler))
+			p, err := NewPool("tls", testUpstream(config.Backend{URL: srv.URL, Weight: 1, TLS: tt.tls}), newFirst, slog.New(slog.DiscardHandler), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -306,7 +307,7 @@ func TestBadCAFile(t *testing.T) {
 				config.Backend{URL: "http://127.0.0.1:9000", Weight: 1},
 				config.Backend{URL: "https://127.0.0.1:9443", Weight: 1, TLS: &config.BackendTLS{CAFile: tt.file}},
 			)
-			_, err := NewPool("api", u, newFirst, slog.New(slog.DiscardHandler))
+			_, err := NewPool("api", u, newFirst, slog.New(slog.DiscardHandler), nil)
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("got %v, want %v", err, tt.want)
 			}
@@ -314,5 +315,128 @@ func TestBadCAFile(t *testing.T) {
 				t.Errorf("error %q does not name the backend", err)
 			}
 		})
+	}
+}
+
+// TestPoolCarryOver checks what a pool built with prev keeps from it. Every
+// case starts from a pool whose first backend has one request in flight and
+// an open breaker, and whose second is unhealthy.
+func TestPoolCarryOver(t *testing.T) {
+	a, b := config.Backend{URL: "http://127.0.0.1:9000", Weight: 1}, config.Backend{URL: "http://127.0.0.1:9001", Weight: 1}
+	base := func() *config.Upstream {
+		u := testUpstream(a, b)
+		u.Health = &config.HealthCheck{Path: "/"}
+		u.CircuitBreaker = &config.CircuitBreaker{FailureRatio: 0.5, MinRequests: 1, OpenFor: time.Hour, Window: 10 * time.Second, HalfOpenProbes: 1}
+		u.Outlier = &config.Outlier{ConsecutiveFailures: 3, BaseEjection: time.Hour, MaxEjection: time.Hour, MaxEjectionPercent: 50}
+		return u
+	}
+	tests := []struct {
+		name   string
+		change func(u *config.Upstream)
+		// What the backend at a's URL keeps, and whether the pool keeps its
+		// outlier detection and b stays unhealthy.
+		transport, breaker, outlier, unhealthy bool
+	}{
+		{"unchanged", func(u *config.Upstream) {}, true, true, true, true},
+		{"weight changed", func(u *config.Upstream) { u.Backends[0].Weight = 5 }, true, true, true, true},
+		{"backend added", func(u *config.Upstream) {
+			u.Backends = append(u.Backends, config.Backend{URL: "http://127.0.0.1:9002", Weight: 1})
+		}, true, true, false, true},
+		{"backends reordered", func(u *config.Upstream) { u.Backends[0], u.Backends[1] = u.Backends[1], u.Backends[0] }, true, true, false, true},
+		{"timeout changed", func(u *config.Upstream) { u.Timeouts.IdleConn = time.Minute }, false, true, true, true},
+		{"pool size changed", func(u *config.Upstream) { u.MaxIdleConnsPerHost = 1 }, false, true, true, true},
+		{"breaker changed", func(u *config.Upstream) { u.CircuitBreaker.OpenFor = time.Minute }, true, false, true, true},
+		{"outlier changed", func(u *config.Upstream) { u.Outlier.ConsecutiveFailures = 4 }, true, true, false, true},
+		{"health removed", func(u *config.Upstream) { u.Health = nil }, true, true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prev, err := NewPool("api", base(), newFirst, slog.New(slog.DiscardHandler), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pa, pb := prev.Backends[0], prev.Backends[1]
+			pa.Acquire()
+			adm, _ := pa.Admit()
+			pa.Report(adm, resilience.Failure) // opens with min_requests 1
+			pb.SetHealthy(false)
+
+			u := base()
+			tt.change(u)
+			p, err := NewPool("api", u, newFirst, slog.New(slog.DiscardHandler), prev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pb.Healthy() {
+				t.Error("NewPool changed the health that prev serves with before Commit")
+			}
+			p.Commit()
+			byURL := map[string]*Backend{}
+			for _, b := range p.Backends {
+				byURL[b.URL.String()] = b
+			}
+			na, nb := byURL[a.URL], byURL[b.URL]
+			if na == pa || na.Weight != u.Backends[slices.IndexFunc(u.Backends, func(c config.Backend) bool { return c.URL == a.URL })].Weight {
+				t.Errorf("backend reused as is, or weight %d not from the new config", na.Weight)
+			}
+			if na.Inflight() != 1 {
+				t.Errorf("inflight = %d, want the old request's 1", na.Inflight())
+			}
+			pa.Release() // the old request ends on the old pool
+			if na.Inflight() != 0 {
+				t.Errorf("inflight = %d after the old request ended, want 0", na.Inflight())
+			}
+			if got := na.Transport == pa.Transport; got != tt.transport {
+				t.Errorf("transport kept = %v, want %v", got, tt.transport)
+			}
+			if got := na.Breaker() == pa.Breaker(); got != tt.breaker {
+				t.Errorf("breaker kept = %v, want %v", got, tt.breaker)
+			}
+			if wantOpen := tt.breaker; (na.Breaker().State() == resilience.BreakerOpen) != wantOpen {
+				t.Errorf("breaker state %v", na.Breaker().State())
+			}
+			if got := p.outlier == prev.outlier; got != tt.outlier {
+				t.Errorf("outlier kept = %v, want %v", got, tt.outlier)
+			}
+			if got := !nb.Healthy(); got != tt.unhealthy {
+				t.Errorf("b unhealthy = %v, want %v", got, tt.unhealthy)
+			}
+			for i, b := range p.Backends {
+				if b.index != i || b.outlier != p.outlier {
+					t.Errorf("backend %d has index %d, or another pool's outlier", i, b.index)
+				}
+			}
+		})
+	}
+}
+
+// TestPoolCarryOverCA checks that a changed CA file gets a new transport even
+// though its path is the same.
+func TestPoolCarryOverCA(t *testing.T) {
+	srv := httptest.NewTLSServer(http.NotFoundHandler())
+	defer srv.Close()
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := testUpstream(config.Backend{URL: srv.URL, Weight: 1, TLS: &config.BackendTLS{CAFile: caFile}})
+	pool := func(prev *Pool) *Pool {
+		p, err := NewPool("tls", u, newFirst, slog.New(slog.DiscardHandler), prev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	p1 := pool(nil)
+	p2 := pool(p1)
+	if p2.Backends[0].Transport != p1.Backends[0].Transport {
+		t.Error("an unchanged CA file got a new transport")
+	}
+	if err := os.WriteFile(caFile, append(caPEM, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if p3 := pool(p2); p3.Backends[0].Transport == p2.Backends[0].Transport {
+		t.Error("a rewritten CA file kept the old transport")
 	}
 }

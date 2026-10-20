@@ -61,25 +61,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	// Build everything -validate checks too, as nginx -t does, so that a
 	// CA file or certificate that does not parse fails here.
-	rt, err := runtime.Build(cfg, logger)
+	metrics := observability.NewMetrics()
+	rt, err := runtime.Build(cfg, logger, runtime.Options{Metrics: metrics})
 	if err != nil {
 		fmt.Fprintln(stderr, "prism:", err)
 		return 1
 	}
-	defer rt.Close()
 	cur := runtime.NewCurrent(rt)
+	// Whichever Runtime is current at exit; reloads retire the others.
+	defer func() { cur.Load().Close() }()
 	srv, err := server.New(cfg.Listeners, cfg.ReadyPath, cur, logger)
 	if err != nil {
 		fmt.Fprintln(stderr, "prism:", err)
 		return 1
 	}
+	reloader := runtime.NewReloader(*configPath, cur, metrics, srv.ReloadCerts, logger)
 	if a := cfg.Admin; a != nil {
-		srv.Admin(a.Listen, admin.New(cur, logger))
+		srv.Admin(a.Listen, admin.New(cur, metrics, reloader.Reload, logger))
 	}
 	if *validateOnly {
 		fmt.Fprintf(stdout, "configuration %s is valid\n", *configPath)
 		return 0
 	}
+	metrics.ConfigLoaded(time.Now())
 
 	logger.Info("config loaded",
 		"path", *configPath,
@@ -92,6 +96,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigs)
+	hups := make(chan os.Signal, 1)
+	signal.Notify(hups, syscall.SIGHUP)
+	defer signal.Stop(hups)
 
 	if err := srv.Start(); err != nil {
 		logger.Error("cannot listen", "error", err)
@@ -101,13 +108,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	logger.Info("prism started", "version", version)
 
 	code := 0
-	select {
-	case sig := <-sigs:
-		logger.Info("shutting down", "signal", sig.String(),
-			"drain_delay", cfg.Shutdown.DrainDelay, "timeout", cfg.Shutdown.Timeout)
-	case err := <-srv.Err():
-		logger.Error("listener failed", "error", err)
-		code = 1
+serve:
+	for {
+		select {
+		case <-hups:
+			logger.Info("reloading", "signal", "hangup", "path", *configPath)
+			reloader.Reload() // logs the outcome; a failure keeps the old config
+		case sig := <-sigs:
+			logger.Info("shutting down", "signal", sig.String(),
+				"drain_delay", cfg.Shutdown.DrainDelay, "timeout", cfg.Shutdown.Timeout)
+			break serve
+		case err := <-srv.Err():
+			logger.Error("listener failed", "error", err)
+			code = 1
+			break serve
+		}
 	}
 	if err := shutdown(srv, cfg.Shutdown, sigs, logger); err != nil {
 		logger.Warn("shutdown did not finish cleanly", "error", err)

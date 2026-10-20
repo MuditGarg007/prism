@@ -18,6 +18,7 @@ import (
 	"github.com/MuditGarg007/prism/internal/config"
 	"github.com/MuditGarg007/prism/internal/health"
 	"github.com/MuditGarg007/prism/internal/limits"
+	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/proxy"
 	"github.com/MuditGarg007/prism/internal/ratelimit"
 	"github.com/MuditGarg007/prism/internal/resilience"
@@ -31,6 +32,8 @@ type Runtime struct {
 	Config  *config.Config
 	Handler *proxy.Handler
 	Pools   map[string]*upstream.Pool
+	// Routes are the routes Handler matches, in config order.
+	Routes []*proxy.Route
 	// Cache is shared by every route that caches, or nil when none does.
 	Cache *Cache
 
@@ -48,34 +51,66 @@ type Cache struct {
 
 func caches(r config.Route) bool { return r.Cache != nil && r.Cache.Enabled }
 
+// Options are what Build needs besides the config.
+type Options struct {
+	// Metrics, when set, gives routes and backends their metric handles.
+	// It is shared by every Runtime of the process.
+	Metrics *observability.Metrics
+	// Prev is the Runtime a reload replaces, or nil. Build carries its
+	// state over where the config allows (see upstream.NewPool), and
+	// shares, never closes, what it carries.
+	Prev *Runtime
+}
+
 // Build creates the pools, routes and handler for cfg, which must already be
 // validated. It fails on problems that validation cannot see, such as a CA
 // file that holds no certificates.
-func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
+func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err error) {
+	m, prev := opts.Metrics, opts.Prev
 	rt := &Runtime{Config: cfg, Pools: make(map[string]*upstream.Pool, len(cfg.Upstreams))}
+	defer func() {
+		if err != nil {
+			rt.Retire(prev) // prev is still serving with what it shares
+		}
+	}()
 	if a := cfg.Admin; a != nil && !loopback(a.Listen) {
 		log.Warn("admin API listens beyond loopback and has no authentication", "addr", a.Listen)
 	}
 	// One store for the whole process, built only when some route uses it.
+	// A reload keeps the entries, the fetches in progress and the counters.
 	if slices.ContainsFunc(cfg.Routes, caches) {
 		size := int64(cfg.Cache.MaxSize)
-		rt.Cache = &Cache{
-			Store:   cache.NewStore(size),
-			Flight:  cache.NewFlight(),
-			Stats:   &cache.Stats{},
-			MaxSize: size,
+		if prev != nil && prev.Cache != nil {
+			c := *prev.Cache
+			c.MaxSize = size // the Store is resized once Build has succeeded
+			rt.Cache = &c
+		} else {
+			rt.Cache = &Cache{
+				Store:   cache.NewStore(size),
+				Flight:  cache.NewFlight(),
+				Stats:   &cache.Stats{},
+				MaxSize: size,
+			}
 		}
 	}
 
 	// Sorted, so warnings and errors come out in the same order every time.
 	for _, name := range slices.Sorted(maps.Keys(cfg.Upstreams)) {
 		u := cfg.Upstreams[name]
-		pool, err := upstream.NewPool(name, u, balancer.New(u.Balancer), log)
+		var prevPool *upstream.Pool
+		if prev != nil {
+			prevPool = prev.Pools[name]
+		}
+		pool, err := upstream.NewPool(name, u, balancer.New(u.Balancer), log, prevPool)
 		if err != nil {
-			rt.Close()
 			return nil, err
 		}
 		rt.Pools[name] = pool
+		if m != nil {
+			for _, b := range pool.Backends {
+				b.Latency = m.Backend(name, b.String())
+			}
+		}
 		if h := u.Health; h != nil {
 			rt.checkers = append(rt.checkers, health.New(pool, health.Config{
 				Path:           h.Path,
@@ -87,27 +122,49 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 		}
 	}
 
+	// A route keeps its limiter, slots and budget across a reload, matched
+	// by name, while their settings are unchanged. Otherwise every reload
+	// would reset rate limits and briefly double concurrency caps.
+	type prevRoute struct {
+		cfg   config.Route
+		route *proxy.Route
+	}
+	prevRoutes := map[string]prevRoute{}
+	if prev != nil {
+		for i, r := range prev.Routes {
+			prevRoutes[r.Name] = prevRoute{prev.Config.Routes[i], r}
+		}
+	}
+
 	entries := make([]router.Entry[*proxy.Route], 0, len(cfg.Routes))
 	for i, r := range cfg.Routes {
+		name := r.Match.Host + r.Match.PathPrefix
+		old, hasOld := prevRoutes[name]
 		pool, ok := rt.Pools[r.Upstream]
 		if !ok {
-			rt.Close()
 			return nil, fmt.Errorf("routes[%d]: unknown upstream %q", i, r.Upstream)
 		}
 		h := r.Headers
 		var limiter *ratelimit.Limiter
 		if rl := r.RateLimit; rl != nil {
-			limiter = ratelimit.New(rl.PerIP.Count, rl.PerIP.Per, rl.Burst)
+			if hasOld && old.cfg.RateLimit != nil && *old.cfg.RateLimit == *rl {
+				limiter = old.route.RateLimit
+			} else {
+				limiter = ratelimit.New(rl.PerIP.Count, rl.PerIP.Per, rl.Burst)
+			}
 		}
 		var retry *resilience.Retry
 		if rc := r.Retry; rc != nil && rc.Attempts > 0 {
 			var err error
 			if retry, err = resilience.NewRetry(rc.Attempts, rc.On); err != nil {
-				rt.Close()
 				return nil, fmt.Errorf("routes[%d].retry: %w", i, err)
 			}
 			retry.Backoff = resilience.Backoff{Base: rc.Backoff.Base, Max: rc.Backoff.Max}
-			retry.Budget = resilience.NewBudget(rc.BudgetRatio, rc.BudgetMinPerSec)
+			if pr := old.route; hasOld && pr.Retry != nil && sameBudget(old.cfg.Retry, rc) {
+				retry.Budget = pr.Retry.Budget
+			} else {
+				retry.Budget = resilience.NewBudget(rc.BudgetRatio, rc.BudgetMinPerSec)
+			}
 		}
 		var pc *proxy.Cache
 		if caches(r) {
@@ -124,31 +181,42 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 		}
 		var sem *limits.Semaphore
 		if r.MaxConcurrency > 0 {
-			sem = limits.NewSemaphore(r.MaxConcurrency, r.QueueSize)
+			if hasOld && old.route.Concurrency != nil &&
+				old.cfg.MaxConcurrency == r.MaxConcurrency && old.cfg.QueueSize == r.QueueSize {
+				sem = old.route.Concurrency
+			} else {
+				sem = limits.NewSemaphore(r.MaxConcurrency, r.QueueSize)
+			}
 		}
+		var rm *observability.RouteMetrics
+		if m != nil {
+			rm = m.Route(name, r.Upstream)
+		}
+		route := &proxy.Route{
+			Name:         name,
+			Pool:         pool,
+			PathPrefix:   r.Match.PathPrefix,
+			StripPrefix:  r.StripPrefix,
+			PreserveHost: r.PreserveHost,
+			Request:      proxy.NewHeaderOps(h.RequestSet, h.RequestRemove),
+			Response:     proxy.NewHeaderOps(h.ResponseSet, h.ResponseRemove),
+			RateLimit:    limiter,
+			MaxBody:      int64(r.MaxBody),
+			Concurrency:  sem,
+			QueueTimeout: r.QueueTimeout,
+			Retry:        retry,
+			Cache:        pc,
+			Metrics:      rm,
+		}
+		rt.Routes = append(rt.Routes, route)
 		entries = append(entries, router.Entry[*proxy.Route]{
 			Host:       r.Match.Host,
 			PathPrefix: r.Match.PathPrefix,
-			Value: &proxy.Route{
-				Name:         r.Match.Host + r.Match.PathPrefix,
-				Pool:         pool,
-				PathPrefix:   r.Match.PathPrefix,
-				StripPrefix:  r.StripPrefix,
-				PreserveHost: r.PreserveHost,
-				Request:      proxy.NewHeaderOps(h.RequestSet, h.RequestRemove),
-				Response:     proxy.NewHeaderOps(h.ResponseSet, h.ResponseRemove),
-				RateLimit:    limiter,
-				MaxBody:      int64(r.MaxBody),
-				Concurrency:  sem,
-				QueueTimeout: r.QueueTimeout,
-				Retry:        retry,
-				Cache:        pc,
-			},
+			Value:      route,
 		})
 	}
 	table, err := router.Compile(entries)
 	if err != nil {
-		rt.Close()
 		return nil, err
 	}
 
@@ -156,8 +224,24 @@ func Build(cfg *config.Config, log *slog.Logger) (*Runtime, error) {
 	for i, p := range cfg.TrustedProxies {
 		trusted[i] = p.Prefix
 	}
-	rt.Handler = proxy.NewHandler(table, proxy.NewForwarding(trusted, cfg.ForwardedHeader), log)
+	var unmatched *observability.RouteMetrics
+	if m != nil {
+		unmatched = m.Unmatched()
+	}
+	rt.Handler = proxy.NewHandler(table, proxy.NewForwarding(trusted, cfg.ForwardedHeader), unmatched, log)
+	// Last, so a reload that fails never shrinks the cache or changes the
+	// backend health that prev serves with.
+	if c := rt.Cache; prev != nil && prev.Cache != nil && c != nil && c.MaxSize != prev.Cache.MaxSize {
+		c.Store.Resize(c.MaxSize)
+	}
+	for _, p := range rt.Pools {
+		p.Commit()
+	}
 	return rt, nil
+}
+
+func sameBudget(a, b *config.Retry) bool {
+	return a != nil && a.BudgetRatio == b.BudgetRatio && a.BudgetMinPerSec == b.BudgetMinPerSec
 }
 
 // loopback reports whether addr only accepts connections from this host.
@@ -185,12 +269,24 @@ func (rt *Runtime) Start() {
 
 // Close stops health checking and closes the idle backend connections of
 // every pool. Requests still using rt keep their connections.
-func (rt *Runtime) Close() {
+func (rt *Runtime) Close() { rt.Retire(nil) }
+
+// Retire is Close for a Runtime that next replaced: it leaves open the
+// idle connections of the transports next carried over. A nil next carried
+// nothing.
+func (rt *Runtime) Retire(next *Runtime) {
 	for _, c := range rt.checkers {
 		c.Stop()
 	}
+	var keep map[*http.Transport]bool
+	if next != nil {
+		keep = map[*http.Transport]bool{}
+		for _, p := range next.Pools {
+			p.AddTransports(keep)
+		}
+	}
 	for _, p := range rt.Pools {
-		p.Close()
+		p.CloseExcept(keep)
 	}
 }
 

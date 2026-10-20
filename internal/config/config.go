@@ -80,8 +80,10 @@ type Upstream struct {
 	MaxIdleConnsPerHost int `yaml:"max_idle_conns_per_host"`
 }
 
+// A redact tag hides a field from the admin API's GET /config: "url" masks
+// a URL's password, and "secret" hides the whole value.
 type Backend struct {
-	URL    string      `yaml:"url"`
+	URL    string      `yaml:"url" redact:"url"`
 	Weight int         `yaml:"weight"`
 	TLS    *BackendTLS `yaml:"tls"`
 }

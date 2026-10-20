@@ -42,7 +42,7 @@ func parse(t *testing.T, yaml, baseDir string) *config.Config {
 
 func build(t testing.TB, cfg *config.Config) *Runtime {
 	t.Helper()
-	rt, err := Build(cfg, discard)
+	rt, err := Build(cfg, discard, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestBuildExample(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
-	rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+	rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestBuildAdminWarning(t *testing.T) {
 		cfg := singleUpstream(t, "http://127.0.0.1:9000")
 		cfg.Admin = &config.Admin{Listen: tt.listen}
 		var logs bytes.Buffer
-		rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+		rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)), Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +245,7 @@ upstreams:
 routes:
   - { match: { path_prefix: / }, upstream: secure }
 `, dir)
-	_, err := Build(cfg, discard)
+	_, err := Build(cfg, discard, Options{})
 	if err == nil || !strings.Contains(err.Error(), "upstream secure") || !strings.Contains(err.Error(), "no PEM certificates") {
 		t.Errorf("Build error = %v, want the bad CA file named", err)
 	}
@@ -254,7 +254,7 @@ routes:
 func TestBuildUnknownUpstream(t *testing.T) {
 	// Validation catches this; Build must not panic on an unvalidated config.
 	cfg := &config.Config{Routes: []config.Route{{Match: config.Match{PathPrefix: "/"}, Upstream: "missing"}}}
-	if _, err := Build(cfg, discard); err == nil || !strings.Contains(err.Error(), `unknown upstream "missing"`) {
+	if _, err := Build(cfg, discard, Options{}); err == nil || !strings.Contains(err.Error(), `unknown upstream "missing"`) {
 		t.Errorf("Build error = %v", err)
 	}
 }

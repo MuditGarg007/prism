@@ -213,7 +213,9 @@ func TestProxyClientCanceled(t *testing.T) {
 		}
 	}
 	// Nothing may be written for a client that is gone. The recorder's
-	// Code stays at its default when WriteHeader is never called.
+	// Code stays at its default when WriteHeader is never called. The
+	// request ID is set on arrival, but never sent.
+	delete(rec.Header(), RequestIDHeader)
 	if rec.Code != http.StatusOK || rec.Body.Len() != 0 || len(rec.Header()) != 0 {
 		t.Errorf("wrote %d %v %q to a gone client", rec.Code, rec.Header(), rec.Body)
 	}

@@ -11,7 +11,7 @@ import (
 func backends(n int) []*upstream.Backend {
 	bs := make([]*upstream.Backend, n)
 	for i := range bs {
-		bs[i] = &upstream.Backend{}
+		bs[i] = upstream.NewBackend(nil, 0)
 	}
 	return bs
 }

@@ -207,6 +207,14 @@ Build these together.
 
 **Exit:** a reload under load test with zero failed requests (run the load generator while reloading in a loop).
 
+**Status:** done on 2026-10-20. The decisions and details are in `docs/m5-handoff.md`. As built:
+
+- Metrics come from `prometheus/client_golang` on the admin listener's `GET /metrics`: requests by route, upstream and status class, request and per-attempt backend latency histograms, retries, budget refusals and proxy errors by kind, plus scrape-time gauges for backend inflight, health, ejection and breaker state, available backends, route concurrency and queue depth, the cache, and reload results. Handles are resolved when a config is built, so recording a request takes no label lookup and no allocation.
+- Every request carries `X-Request-Id`, kept from a trusted peer when well formed and generated otherwise. It goes to the backend and the client, and comes first in the access log.
+- The admin API adds `GET /routes`, `GET /upstreams`, `GET /config` (the effective config, with a redaction hook for M6 secrets) and `POST /reload`.
+- SIGHUP and `POST /reload` reload the config: load, validate, re-read certificates, build, swap. Reloads are serialized, and a failure changes nothing. Backends keep their health, inflight count, breaker and pooled connections, routes their rate limiter, semaphore and retry budget, and the cache its entries, each while its settings are unchanged. Listener, admin, shutdown and ready path changes need a restart and are warned about. Series of removed routes and backends are deleted.
+- The exit test is `TestReloadUnderLoad` (40 reloads through `POST /reload` under 8 busy workers, zero failures, connections reused, breaker and health state kept), and `make reload` runs `scripts/reload-under-load.sh` against the real binary with a `kill -HUP` every 0.25 s.
+
 ### M6: Advanced routing and security, rest of Layer 5 (1–1.5 weeks)
 
 - Canary: a weighted split per route, plus a header or cookie override to force a version.

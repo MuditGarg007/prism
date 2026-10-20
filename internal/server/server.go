@@ -23,6 +23,7 @@ import (
 type Server struct {
 	log      *slog.Logger
 	servers  []*http.Server
+	certs    []*atomic.Pointer[certStore] // by listener, nil without TLS
 	addrs    []net.Addr
 	errc     chan error
 	draining atomic.Bool
@@ -48,19 +49,49 @@ func New(listeners []config.Listener, readyPath string, h http.Handler, log *slo
 			// Mostly TLS handshake failures from clients and scanners.
 			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 		}
+		var certs *atomic.Pointer[certStore]
 		if l.TLS != nil {
-			certs, err := loadCerts(l.TLS.Certs)
+			store, err := loadCerts(l.TLS.Certs)
 			if err != nil {
 				return nil, fmt.Errorf("listeners[%d]: %w", i, err)
 			}
+			certs = &atomic.Pointer[certStore]{}
+			certs.Store(store)
 			srv.TLSConfig = &tls.Config{
-				MinVersion:     tls.VersionTLS12,
-				GetCertificate: certs.get,
+				MinVersion: tls.VersionTLS12,
+				GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+					return certs.Load().get(hello)
+				},
 			}
 		}
 		s.servers = append(s.servers, srv)
+		s.certs = append(s.certs, certs)
 	}
 	return s, nil
+}
+
+// ReloadCerts loads the certificates of listeners, the listeners New was
+// given with new certificate pairs, and returns a func that swaps them in.
+// Nothing changes unless every certificate loads, and handshakes already
+// under way finish with the certificate they picked. A listener whose
+// address or TLS setting differs from New's is skipped: it needs a restart.
+func (s *Server) ReloadCerts(listeners []config.Listener) (swap func(), err error) {
+	stores := make([]*certStore, len(s.certs))
+	for i, l := range listeners {
+		if i >= len(s.certs) || s.certs[i] == nil || l.TLS == nil || l.Addr != s.servers[i].Addr {
+			continue
+		}
+		if stores[i], err = loadCerts(l.TLS.Certs); err != nil {
+			return nil, fmt.Errorf("listeners[%d]: %w", i, err)
+		}
+	}
+	return func() {
+		for i, store := range stores {
+			if store != nil {
+				s.certs[i].Store(store)
+			}
+		}
+	}, nil
 }
 
 // Admin adds a listener on addr that serves h, the admin API. It skips the

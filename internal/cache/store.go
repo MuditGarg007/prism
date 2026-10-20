@@ -128,6 +128,20 @@ func (s *Store) Purge(host, path string, prefix bool) int {
 	})
 }
 
+// Resize changes the Store's byte budget, evicting the least recently used
+// entries until what is held fits. A reload calls it when max_size changes,
+// so the cache stays warm.
+func (s *Store) Resize(maxBytes int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.lru
+	l.maxBytes = maxBytes
+	for l.bytes > l.maxBytes {
+		l.unlink(l.root.prev)
+		l.evictions++
+	}
+}
+
 // Stats returns the Store's current size.
 func (s *Store) Stats() StoreStats {
 	s.mu.Lock()

@@ -260,6 +260,31 @@ func TestParseByteSize(t *testing.T) {
 	}
 }
 
+func TestMarshalText(t *testing.T) {
+	sizes := map[ByteSize]string{0: "0B", 1500: "1500B", 1 << 10: "1KB", 1536: "1536B", 64 << 20: "64MB", 3 << 30: "3GB", 1<<30 + 1<<20: "1025MB"}
+	for b, want := range sizes {
+		got, _ := b.MarshalText()
+		if string(got) != want {
+			t.Errorf("ByteSize(%d) = %q, want %q", b, got, want)
+		}
+		if back, err := ParseByteSize(string(got)); err != nil || back != b {
+			t.Errorf("ParseByteSize(%q) = %d, %v; want %d", got, back, err, b)
+		}
+	}
+	for _, s := range []string{"100/s", "600/m", "1/h"} {
+		r, err := ParseRate(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := r.MarshalText(); string(got) != s {
+			t.Errorf("Rate %+v = %q, want %q", r, got, s)
+		}
+	}
+	if got, _ := (Rate{Count: 3, Per: 2 * time.Second}).MarshalText(); string(got) != "3/2s" {
+		t.Errorf("odd rate = %q, want 3/2s", got)
+	}
+}
+
 func TestParseRate(t *testing.T) {
 	tests := []struct {
 		in   string

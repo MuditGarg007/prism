@@ -157,6 +157,39 @@ func TestStoreIndexFollowsEviction(t *testing.T) {
 	}
 }
 
+func TestStoreResize(t *testing.T) {
+	var es []*Entry
+	for i := range 4 {
+		es = append(es, response(fmt.Sprintf("GET http://a/%d", i), "", http.Header{}, "body"))
+	}
+	size := es[0].Size()
+	s := NewStore(4 * size)
+	for _, e := range es {
+		s.Put(e)
+	}
+	s.Get(es[0].Primary, http.Header{}) // 1 is now the least recently used
+
+	s.Resize(2*size + size/2)
+	if st := s.Stats(); st.Entries != 2 || st.Bytes != 2*size || st.Evictions != 2 {
+		t.Errorf("after shrinking: %+v, want 2 entries, 2 evictions", st)
+	}
+	for i, want := range []bool{true, false, false, true} {
+		if _, ok := s.Get(es[i].Primary, http.Header{}); ok != want {
+			t.Errorf("entry %d kept = %v, want %v", i, ok, want)
+		}
+	}
+	if _, ok := s.vary[es[1].Primary]; ok {
+		t.Error("the Vary index kept an evicted entry")
+	}
+
+	s.Resize(4 * size)
+	s.Put(es[1])
+	s.Put(es[2])
+	if st := s.Stats(); st.Entries != 4 || st.Evictions != 2 {
+		t.Errorf("after growing: %+v, want all 4 entries and no new evictions", st)
+	}
+}
+
 func TestStoreRemoveOnlyThatEntry(t *testing.T) {
 	s := NewStore(1 << 20)
 	old := response("GET http://a/x", "", http.Header{}, "old")

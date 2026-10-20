@@ -28,8 +28,8 @@ type Config struct {
 	HealthyAfter   int // consecutive passed checks that mark it up again
 }
 
-// Checker runs one goroutine per backend of a pool. Backends start healthy,
-// so a new pool serves traffic before its first round of checks.
+// Checker runs one goroutine per backend of a pool. New backends start
+// healthy, so a new pool serves traffic before its first round of checks.
 type Checker struct {
 	cfg  Config
 	pool *upstream.Pool
@@ -72,7 +72,9 @@ func (c *Checker) Stop() {
 
 func (c *Checker) run(ctx context.Context, b *upstream.Backend) {
 	log := c.log.With("backend", b.String())
-	t := tracker{unhealthyAfter: c.cfg.UnhealthyAfter, healthyAfter: c.cfg.HealthyAfter}
+	// Start from the backend's current state, which a reload carries over,
+	// so a backend that was down needs healthy_after passes to come back.
+	t := tracker{unhealthyAfter: c.cfg.UnhealthyAfter, healthyAfter: c.cfg.HealthyAfter, unhealthy: !b.Healthy()}
 	// A random first offset spreads the checks of many backends, and of
 	// many proxies started together, over the interval.
 	timer := time.NewTimer(c.randN(c.cfg.Interval))

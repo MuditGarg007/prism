@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/MuditGarg007/prism/internal/limits"
+	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/ratelimit"
 	"github.com/MuditGarg007/prism/internal/resilience"
 	"github.com/MuditGarg007/prism/internal/router"
@@ -37,6 +38,8 @@ type Route struct {
 	QueueTimeout time.Duration      // longest wait for a Concurrency slot
 	Retry        *resilience.Retry  // nil for no retries
 	Cache        *Cache             // nil when the route does not cache
+	// Metrics are the route's metric handles; nil records nothing.
+	Metrics *observability.RouteMetrics
 }
 
 // Annotations record how the proxy handled one request, for the access log.
@@ -51,6 +54,12 @@ type Annotations struct {
 	BudgetExhausted bool
 	// Cache is the X-Cache value sent, or "" when the cache was not used.
 	Cache string
+	// RequestID is the ID sent to the backend and the client in
+	// X-Request-Id.
+	RequestID string
+	// Metrics are the handles to record the request with: its route's, or
+	// the unmatched ones.
+	Metrics *observability.RouteMetrics
 }
 
 // Annotated is implemented by a ResponseWriter that wants Annotations
@@ -64,15 +73,17 @@ type Annotated interface {
 // after NewHandler, so a config reload swaps in a new Handler instead of
 // editing this one.
 type Handler struct {
-	routes *router.Table[*Route]
-	fwd    *Forwarding
-	log    *slog.Logger
+	routes    *router.Table[*Route]
+	fwd       *Forwarding
+	unmatched *observability.RouteMetrics
+	log       *slog.Logger
 }
 
 // NewHandler returns a Handler that matches requests against routes and
-// reports forwarding failures to log.
-func NewHandler(routes *router.Table[*Route], fwd *Forwarding, log *slog.Logger) *Handler {
-	return &Handler{routes: routes, fwd: fwd, log: log}
+// reports forwarding failures to log. Requests that match no route are
+// recorded with unmatched, which may be nil.
+func NewHandler(routes *router.Table[*Route], fwd *Forwarding, unmatched *observability.RouteMetrics, log *slog.Logger) *Handler {
+	return &Handler{routes: routes, fwd: fwd, unmatched: unmatched, log: log}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +91,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a, ok := w.(Annotated); ok {
 		an = a.Annotations()
 	}
-	an.ClientIP = h.fwd.ClientIP(r.Header, PeerAddr(r.RemoteAddr))
+	peer := PeerAddr(r.RemoteAddr)
+	an.ClientIP = h.fwd.ClientIP(r.Header, peer)
+	// Set first, so every response carries it, a rejection included.
+	an.RequestID = h.requestID(r.Header, peer)
+	w.Header()[RequestIDHeader] = []string{an.RequestID}
+	an.Metrics = h.unmatched
 
 	// The router matches the path as given, and backends may normalize it,
 	// so "/public/../admin" would match /public/ and be served as /admin.
@@ -95,6 +111,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	an.Route = rt
+	an.Metrics = rt.Metrics
 	if rt.RateLimit != nil {
 		if ok, wait := rt.RateLimit.Allow(an.ClientIP); !ok {
 			reject(w, an, http.StatusTooManyRequests, kindRateLimited, wait)
@@ -234,8 +251,12 @@ func (h *Handler) fetch(r *http.Request, rt *Route, an *Annotations) (fetched, *
 		an.Backend = b
 		an.Attempts++
 		b.Acquire()
+		start := time.Now()
 		// RoundTrip, not http.Client, so redirects go back to the client.
-		resp, err = b.Transport.RoundTrip(h.outgoing(r, rt, b, &body))
+		resp, err = b.Transport.RoundTrip(h.outgoing(r, rt, b, &body, an.RequestID))
+		if err == nil && b.Latency != nil {
+			b.Latency.Observe(time.Since(start).Seconds())
+		}
 		out = outcome(r, &body, resp, err)
 		b.Report(adm, out)
 		next, nextAdm := h.retryTarget(r, rt, an, &body, &choice, b, resp, err)
@@ -244,7 +265,7 @@ func (h *Handler) fetch(r *http.Request, rt *Route, an *Annotations) (fetched, *
 		}
 		if err != nil {
 			_, kind := classify(r.Context(), err)
-			h.logError(r, slog.LevelWarn, "upstream attempt failed, retrying", rt, b, 0, kind, err)
+			h.logError(r, slog.LevelWarn, "upstream attempt failed, retrying", an, b, 0, kind, err)
 		} else {
 			resp.Body.Close()
 		}
@@ -265,6 +286,9 @@ func (h *Handler) fetch(r *http.Request, rt *Route, an *Annotations) (fetched, *
 		return fetched{}, &fetchError{b: b, err: err, clientBody: body.clientFailed() && !errors.As(err, &mbe)}
 	}
 	removeHopByHop(resp.Header)
+	// The client gets this request's ID, not one the backend echoes back,
+	// and the cache never stores one request's ID to send with another.
+	delete(resp.Header, RequestIDHeader)
 	return fetched{resp: resp, b: b, adm: adm, out: out}, nil
 }
 
@@ -406,12 +430,13 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// outgoing builds the request to send to b. Its context is r's, so a client
-// that disconnects cancels the backend request too.
-func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend, rb *requestBody) *http.Request {
+// outgoing builds the request with ID id to send to b. Its context is r's,
+// so a client that disconnects cancels the backend request too.
+func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend, rb *requestBody, id string) *http.Request {
 	hdr := r.Header.Clone()
 	cleanRequestHeaders(hdr)
 	h.fwd.Apply(hdr, PeerAddr(r.RemoteAddr), r.Host, r.TLS != nil)
+	hdr[RequestIDHeader] = []string{id}
 	rt.Request.Apply(hdr)
 
 	host := b.URL.Host

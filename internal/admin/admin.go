@@ -1,5 +1,7 @@
-// Package admin serves the admin API: cache statistics and purging. It has
-// no authentication, so it belongs on a loopback listener.
+// Package admin serves the admin API: the routes, the live state of the
+// upstreams, the effective config, Prometheus metrics, config reloads, and
+// cache statistics and purging. It has no authentication, so it belongs on a loopback
+// listener.
 package admin
 
 import (
@@ -10,6 +12,9 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/runtime"
 )
 
@@ -19,16 +24,34 @@ const maxBody = 64 << 10
 // Handler serves the admin API from whichever Runtime is current when each
 // request arrives, so it keeps working across reloads.
 type Handler struct {
-	cur *runtime.Current
-	log *slog.Logger
-	mux *http.ServeMux
+	cur    *runtime.Current
+	reload func() error
+	log    *slog.Logger
+	mux    *http.ServeMux
 }
 
-// New returns the admin API for cur.
-func New(cur *runtime.Current, log *slog.Logger) *Handler {
-	h := &Handler{cur: cur, log: log, mux: http.NewServeMux()}
+// New returns the admin API for cur. When m is set, GET /metrics serves its
+// registry, to which New adds the state of whichever Runtime is current. It
+// must be called at most once per m. When reload is set, POST /reload calls
+// it, as SIGHUP does.
+func New(cur *runtime.Current, m *observability.Metrics, reload func() error, log *slog.Logger) *Handler {
+	h := &Handler{cur: cur, reload: reload, log: log, mux: http.NewServeMux()}
+	h.mux.HandleFunc("GET /routes", h.routes)
+	h.mux.HandleFunc("GET /upstreams", h.upstreams)
+	h.mux.HandleFunc("GET /config", h.config)
 	h.mux.HandleFunc("GET /cache/stats", h.cacheStats)
 	h.mux.HandleFunc("POST /cache/purge", h.cachePurge)
+	if reload != nil {
+		h.mux.HandleFunc("POST /reload", h.reloadConfig)
+	}
+	if m != nil {
+		m.Registry.MustRegister(collector{cur})
+		h.mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{
+			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+			// A broken collector loses its own series, not the scrape.
+			ErrorHandling: promhttp.ContinueOnError,
+		}))
+	}
 	return h
 }
 
@@ -37,8 +60,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-// CacheStats is the body of GET /cache/stats. The counters only grow; a
-// Prometheus exporter in M5 maps them onto counters and gauges.
+// ReloadResponse is the body of a successful POST /reload. A failed one
+// answers 500 with the error, and the previous config keeps serving.
+type ReloadResponse struct {
+	Reloaded bool `json:"reloaded"`
+}
+
+func (h *Handler) reloadConfig(w http.ResponseWriter, r *http.Request) {
+	if err := h.reload(); err != nil {
+		writeError(w, http.StatusInternalServerError, "reload failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ReloadResponse{Reloaded: true})
+}
+
+// CacheStats is the body of GET /cache/stats. The counters only grow.
+// GET /metrics reports the same numbers as prism_cache_* metrics.
 type CacheStats struct {
 	Entries   int    `json:"entries"`
 	Bytes     int64  `json:"bytes"`

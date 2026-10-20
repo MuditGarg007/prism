@@ -99,7 +99,7 @@ func newPool(t *testing.T, urls ...string) *upstream.Pool {
 		u.Backends = append(u.Backends, config.Backend{URL: url, Weight: 1})
 	}
 	u.Timeouts.Connect = time.Second
-	p, err := upstream.NewPool("web", u, balancer.New(config.BalancerRoundRobin), slog.New(slog.DiscardHandler))
+	p, err := upstream.NewPool("web", u, balancer.New(config.BalancerRoundRobin), slog.New(slog.DiscardHandler), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,5 +229,22 @@ func TestCheckerStop(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if got := fb.count(); got != n {
 		t.Errorf("%d checks after Stop", got-n)
+	}
+}
+
+// TestCheckerStartsFromState checks that a checker started on a backend
+// that is already down, as after a reload, needs healthy_after passing
+// checks to bring it back rather than trusting it at once.
+func TestCheckerStartsFromState(t *testing.T) {
+	fb := newFlipBackend(t)
+	pool := newPool(t, fb.URL)
+	b := pool.Backends[0]
+	b.SetHealthy(false)
+	c := New(pool, Config{Path: "/", Interval: time.Millisecond, Timeout: time.Second, UnhealthyAfter: 1, HealthyAfter: 3}, slog.New(slog.DiscardHandler))
+	c.Start()
+	defer c.Stop()
+	waitFor(t, "the backend to come back", b.Healthy)
+	if n := fb.count(); n < 3 {
+		t.Errorf("healthy again after %d checks, want at least 3", n)
 	}
 }

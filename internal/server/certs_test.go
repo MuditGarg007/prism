@@ -8,7 +8,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,5 +136,62 @@ func BenchmarkCertGet(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		s.get(hello)
+	}
+}
+
+// TestReloadCerts checks that rotated certificate files are served only once
+// the swap runs, that a bad file changes nothing, and that a listener whose
+// address changed is skipped.
+func TestReloadCerts(t *testing.T) {
+	dir := t.TempDir()
+	pair, first := writeCert(t, dir, "a", "a.test")
+	l := plainListener()
+	l.TLS = &config.ListenerTLS{Certs: []config.CertPair{pair}}
+	s, urls := start(t, []config.Listener{l}, http.NotFoundHandler(), slog.New(slog.DiscardHandler))
+	serving := func() *big.Int {
+		t.Helper()
+		// Only which certificate is served matters here, not trust.
+		conn, err := tls.Dial("tcp", strings.TrimPrefix(urls[0], "https://"),
+			&tls.Config{ServerName: "a.test", InsecureSkipVerify: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		return conn.ConnectionState().PeerCertificates[0].SerialNumber
+	}
+	listeners := []config.Listener{l} // New's pairs, whose files now change
+
+	_, rotated := writeCert(t, dir, "a", "a.test")
+	swap, err := s.ReloadCerts(listeners)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := serving(); got.Cmp(first.SerialNumber) != 0 {
+		t.Error("the new certificate was served before the swap")
+	}
+	swap()
+	if got := serving(); got.Cmp(rotated.SerialNumber) != 0 {
+		t.Error("the rotated certificate is not served after the swap")
+	}
+
+	if err := os.WriteFile(pair.Cert, []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReloadCerts(listeners); err == nil || !strings.Contains(err.Error(), "listeners[0]") {
+		t.Errorf("err = %v, want a listeners[0] error", err)
+	}
+	if got := serving(); got.Cmp(rotated.SerialNumber) != 0 {
+		t.Error("a failed reload changed the served certificate")
+	}
+
+	moved := l
+	moved.Addr = "127.0.0.1:1"
+	swap, err = s.ReloadCerts([]config.Listener{moved})
+	if err != nil {
+		t.Fatalf("a moved listener's certificates were loaded: %v", err)
+	}
+	swap()
+	if got := serving(); got.Cmp(rotated.SerialNumber) != 0 {
+		t.Error("a moved listener's swap changed the served certificate")
 	}
 }

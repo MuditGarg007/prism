@@ -44,6 +44,17 @@ func ParseByteSize(s string) (ByteSize, error) {
 	return ByteSize(n * mult), nil
 }
 
+// MarshalText writes b in the largest unit that holds it exactly, such as
+// "64MB" or "1500B", which ParseByteSize reads back.
+func (b ByteSize) MarshalText() ([]byte, error) {
+	for _, u := range []string{"GB", "MB", "KB"} {
+		if m := byteUnits[u]; b != 0 && int64(b)%m == 0 {
+			return fmt.Appendf(nil, "%d%s", int64(b)/m, u), nil
+		}
+	}
+	return fmt.Appendf(nil, "%dB", int64(b)), nil
+}
+
 func (b *ByteSize) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.ScalarNode {
 		return fmt.Errorf("line %d: size must be a scalar", n.Line)
@@ -84,6 +95,16 @@ func ParseRate(s string) (Rate, error) {
 		return Rate{}, fmt.Errorf("invalid rate %q: unit must be s, m or h", s)
 	}
 	return Rate{Count: n, Per: per}, nil
+}
+
+// MarshalText writes r as ParseRate reads it, such as "100/s".
+func (r Rate) MarshalText() ([]byte, error) {
+	for unit, per := range rateUnits {
+		if per == r.Per {
+			return fmt.Appendf(nil, "%d/%s", r.Count, unit), nil
+		}
+	}
+	return fmt.Appendf(nil, "%d/%s", r.Count, r.Per), nil
 }
 
 func (r *Rate) UnmarshalYAML(n *yaml.Node) error {

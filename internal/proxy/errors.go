@@ -96,7 +96,7 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, rt *Route, b *ups
 		level, msg = slog.LevelDebug, "request body too large"
 		closeAfter(w, r)
 	}
-	h.logError(r, level, msg, rt, b, status, kind, err)
+	h.logError(r, level, msg, an, b, status, kind, err)
 	if kind == kindClientClosed {
 		return
 	}
@@ -123,7 +123,7 @@ func (h *Handler) clientBodyFailed(w http.ResponseWriter, r *http.Request, rt *R
 		status, kind = StatusClientClosedRequest, kindClientClosed
 	}
 	an.Error = string(kind)
-	h.logError(r, slog.LevelDebug, "reading request body failed", rt, b, status, kind, err)
+	h.logError(r, slog.LevelDebug, "reading request body failed", an, b, status, kind, err)
 	if kind == kindClientClosed {
 		return
 	}
@@ -152,23 +152,26 @@ func (h *Handler) abort(r *http.Request, rt *Route, b *upstream.Backend, an *Ann
 	_, kind := classify(r.Context(), err)
 	an.Error = string(kind)
 	if kind == kindClientClosed {
-		h.logError(r, slog.LevelDebug, "client closed request", rt, b, StatusClientClosedRequest, kind, err)
+		h.logError(r, slog.LevelDebug, "client closed request", an, b, StatusClientClosedRequest, kind, err)
 		return
 	}
-	h.logError(r, slog.LevelWarn, "upstream response body failed", rt, b, 0, kind, err)
+	h.logError(r, slog.LevelWarn, "upstream response body failed", an, b, 0, kind, err)
 	panic(http.ErrAbortHandler)
 }
 
-func (h *Handler) logError(r *http.Request, level slog.Level, msg string, rt *Route, b *upstream.Backend, status int, kind errorKind, err error) {
+// logError logs a failure of the request that an, whose Route is set,
+// describes. The request ID ties the line to the request's access log entry.
+func (h *Handler) logError(r *http.Request, level slog.Level, msg string, an *Annotations, b *upstream.Backend, status int, kind errorKind, err error) {
 	ctx := r.Context()
 	if !h.log.Enabled(ctx, level) {
 		return
 	}
 	attrs := []slog.Attr{
+		slog.String("request_id", an.RequestID),
 		slog.String("method", r.Method),
 		slog.String("host", r.Host),
 		slog.String("path", r.URL.Path),
-		slog.String("upstream", rt.Pool.Name),
+		slog.String("upstream", an.Route.Pool.Name),
 	}
 	if b != nil {
 		attrs = append(attrs, slog.String("backend", b.String()))

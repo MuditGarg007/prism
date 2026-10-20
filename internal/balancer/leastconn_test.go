@@ -38,7 +38,7 @@ func TestLeastConnLighter(t *testing.T) {
 		{name: "zero weight counts as one", wa: 0, ia: 0, wb: 1, ib: 1, wantA: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			a, b := &upstream.Backend{Weight: tt.wa}, &upstream.Backend{Weight: tt.wb}
+			a, b := upstream.NewBackend(nil, tt.wa), upstream.NewBackend(nil, tt.wb)
 			load(a, tt.ia)
 			load(b, tt.ib)
 			lc := seededLeastConn(nil)

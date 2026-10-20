@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/proxy"
 )
 
@@ -40,8 +41,9 @@ func (w *logWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *logWriter) Annotations() *proxy.Annotations { return &w.an }
 
-// accessLog logs one line per request when it finishes, including requests
-// whose handler aborted with a panic.
+// accessLog logs one line per request when it finishes, and records it in
+// the metrics the proxy annotated it with, including requests whose handler
+// aborted with a panic.
 func accessLog(next http.Handler, log *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lw := &logWriter{ResponseWriter: w}
@@ -59,9 +61,6 @@ func accessLog(next http.Handler, log *slog.Logger) http.Handler {
 
 func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duration, aborted bool) {
 	ctx := r.Context()
-	if !log.Enabled(ctx, slog.LevelInfo) {
-		return
-	}
 	status := lw.status
 	if status == 0 {
 		// Nothing was written. net/http sends 200 for that, unless the
@@ -71,7 +70,21 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 			status = proxy.StatusClientClosedRequest
 		}
 	}
+	an := &lw.an
+	an.Metrics.Observe(observability.Request{
+		Status:          status,
+		Duration:        d,
+		Attempts:        an.Attempts,
+		BudgetExhausted: an.BudgetExhausted,
+		ErrorKind:       an.Error,
+	})
+	if !log.Enabled(ctx, slog.LevelInfo) {
+		return
+	}
 	attrs := make([]slog.Attr, 0, 16)
+	if an.RequestID != "" {
+		attrs = append(attrs, slog.String("request_id", an.RequestID))
+	}
 	attrs = append(attrs,
 		slog.String("method", r.Method),
 		slog.String("host", r.Host),
@@ -81,7 +94,6 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 		slog.Int64("bytes", lw.bytes),
 		slog.Duration("duration", d),
 	)
-	an := &lw.an
 	if an.ClientIP.IsValid() {
 		attrs = append(attrs, slog.String("client", an.ClientIP.String()))
 	}

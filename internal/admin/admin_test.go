@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,7 +37,7 @@ routes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := runtime.Build(cfg, discard)
+	rt, err := runtime.Build(cfg, discard, runtime.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func do(h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 
 func TestCacheStats(t *testing.T) {
 	rt := cachingRuntime(t, true)
-	h := New(runtime.NewCurrent(rt), discard)
+	h := New(runtime.NewCurrent(rt), nil, nil, discard)
 	fill(t, rt, "http://a.test/x", "http://a.test/y")
 	rec := httptest.NewRecorder()
 	rt.Handler.ServeHTTP(rec, httptest.NewRequest("GET", "http://a.test/x", nil))
@@ -104,7 +105,7 @@ func TestCachePurge(t *testing.T) {
 	}
 	for _, tt := range tests {
 		rt := cachingRuntime(t, true)
-		h := New(runtime.NewCurrent(rt), discard)
+		h := New(runtime.NewCurrent(rt), nil, nil, discard)
 		fill(t, rt, "http://a.test/x", "http://a.test/x?q=1", "http://a.test/xyz", "http://a.test/y", "http://b.test/x")
 
 		rec := do(h, "POST", "/cache/purge", tt.body)
@@ -124,7 +125,7 @@ func TestCachePurge(t *testing.T) {
 
 func TestCachePurgeInvalid(t *testing.T) {
 	rt := cachingRuntime(t, true)
-	h := New(runtime.NewCurrent(rt), discard)
+	h := New(runtime.NewCurrent(rt), nil, nil, discard)
 	fill(t, rt, "http://a.test/x")
 	for _, body := range []string{
 		``,
@@ -149,7 +150,7 @@ func TestCachePurgeInvalid(t *testing.T) {
 }
 
 func TestRouting(t *testing.T) {
-	h := New(runtime.NewCurrent(cachingRuntime(t, true)), discard)
+	h := New(runtime.NewCurrent(cachingRuntime(t, true)), nil, nil, discard)
 	tests := []struct {
 		method, path string
 		code         int
@@ -157,6 +158,10 @@ func TestRouting(t *testing.T) {
 		{"POST", "/cache/stats", http.StatusMethodNotAllowed},
 		{"GET", "/cache/purge", http.StatusMethodNotAllowed},
 		{"GET", "/nothing", http.StatusNotFound},
+		{"POST", "/routes", http.StatusMethodNotAllowed},
+		{"DELETE", "/upstreams", http.StatusMethodNotAllowed},
+		{"PUT", "/config", http.StatusMethodNotAllowed},
+		{"GET", "/config", http.StatusOK},
 	}
 	for _, tt := range tests {
 		rec := do(h, tt.method, tt.path, "")
@@ -170,7 +175,7 @@ func TestRouting(t *testing.T) {
 }
 
 func TestNoCache(t *testing.T) {
-	h := New(runtime.NewCurrent(cachingRuntime(t, false)), discard)
+	h := New(runtime.NewCurrent(cachingRuntime(t, false)), nil, nil, discard)
 	for _, req := range []struct{ method, path, body string }{
 		{"GET", "/cache/stats", ""},
 		{"POST", "/cache/purge", `{"host": "a.test", "path": "/x"}`},
@@ -186,11 +191,39 @@ func TestNoCache(t *testing.T) {
 func TestReload(t *testing.T) {
 	a, b := cachingRuntime(t, true), cachingRuntime(t, true)
 	cur := runtime.NewCurrent(a)
-	h := New(cur, discard)
+	h := New(cur, nil, nil, discard)
 	fill(t, b, "http://a.test/x")
 	cur.Swap(b)
 	rec := do(h, "POST", "/cache/purge", `{"host": "a.test", "path": "/x"}`)
 	if !strings.Contains(rec.Body.String(), `"purged":1`) {
 		t.Errorf("purge after reload: %s", rec.Body)
+	}
+}
+
+// TestReloadEndpoint checks POST /reload's answers, and that it exists only
+// with a reloader.
+func TestReloadEndpoint(t *testing.T) {
+	cur := runtime.NewCurrent(cachingRuntime(t, false))
+	var err error
+	calls := 0
+	h := New(cur, nil, func() error { calls++; return err }, discard)
+
+	rec := do(h, "POST", "/reload", "")
+	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != `{"reloaded":true}` {
+		t.Errorf("success: %d %s", rec.Code, rec.Body)
+	}
+	err = errors.New("routes[0]: unknown upstream")
+	rec = do(h, "POST", "/reload", "")
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "reload failed: routes[0]: unknown upstream") {
+		t.Errorf("failure: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(h, "GET", "/reload", ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: %d", rec.Code)
+	}
+	if calls != 2 {
+		t.Errorf("reload called %d times, want 2", calls)
+	}
+	if rec := do(New(cur, nil, nil, discard), "POST", "/reload", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("without a reloader: %d, want 404", rec.Code)
 	}
 }

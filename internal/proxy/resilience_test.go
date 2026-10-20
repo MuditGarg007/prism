@@ -163,7 +163,7 @@ func (l lateBalancer) Pick(c upstream.Choice) (*upstream.Backend, error) {
 func TestPickSkipsRefusingBackend(t *testing.T) {
 	u := poolUpstream("http://127.0.0.1:1", "http://127.0.0.1:2")
 	u.CircuitBreaker = &config.CircuitBreaker{FailureRatio: 1, MinRequests: 1, OpenFor: time.Hour, Window: 10 * time.Second, HalfOpenProbes: 1}
-	pool, err := upstream.NewPool("test", u, func(bs []*upstream.Backend) upstream.Balancer { return lateBalancer{bs} }, slog.New(slog.DiscardHandler))
+	pool, err := upstream.NewPool("test", u, func(bs []*upstream.Backend) upstream.Balancer { return lateBalancer{bs} }, slog.New(slog.DiscardHandler), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -115,7 +115,7 @@ func testUpstream(backendURL string) *config.Upstream {
 // newHandler builds a handler with one route, rt, to the upstream u.
 func newHandler(t testing.TB, u *config.Upstream, rt *Route, log *slog.Logger, trusted ...netip.Prefix) *Handler {
 	t.Helper()
-	pool, err := upstream.NewPool("test", u, balancer.New(config.BalancerRoundRobin), log)
+	pool, err := upstream.NewPool("test", u, balancer.New(config.BalancerRoundRobin), log, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func newHandler(t testing.TB, u *config.Upstream, rt *Route, log *slog.Logger, t
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewHandler(table, NewForwarding(trusted, false), log)
+	return NewHandler(table, NewForwarding(trusted, false), nil, log)
 }
 
 // serve starts a server for h and returns its URL.

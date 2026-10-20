@@ -217,7 +217,7 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 		if now := c.now(); o.stale != nil && c.staleOK(o.stale, now) {
 			_, kind := classify(r.Context(), fe.err)
 			an.Error = string(kind)
-			h.logError(r, slog.LevelWarn, "upstream request failed, serving stale", rt, fe.b, 0, kind, fe.err)
+			h.logError(r, slog.LevelWarn, "upstream request failed, serving stale", an, fe.b, 0, kind, fe.err)
 			h.serveEntry(w, r, rt, c, an, o.stale, now, cacheStale)
 			return
 		}
@@ -237,7 +237,7 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 		switch {
 		case resp.StatusCode >= 500 && c.staleOK(e, received):
 			an.Error = string(kindUpstream)
-			h.logError(r, slog.LevelWarn, "upstream returned an error, serving stale", rt, f.b, resp.StatusCode, kindUpstream,
+			h.logError(r, slog.LevelWarn, "upstream returned an error, serving stale", an, f.b, resp.StatusCode, kindUpstream,
 				fmt.Errorf("status %d", resp.StatusCode))
 			h.serveEntry(w, r, rt, c, an, e, received, cacheStale)
 			return
@@ -253,7 +253,7 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 					why = "size"
 					fallthrough
 				default:
-					h.notStored(r, rt, why)
+					h.notStored(r, an, why)
 					c.Store.Remove(e)
 				}
 				if o.call != nil {
@@ -278,7 +278,7 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 			stored = resp.Header.Clone()
 			tee = newTeeBody(resp, c.MaxObject, o.call)
 		} else {
-			h.notStored(r, rt, why)
+			h.notStored(r, an, why)
 			// A backend failure says nothing about whether the URL can be
 			// cached, or about the stale entry, so only an answer that
 			// is not a failure marks the key and replaces the entry.
@@ -345,12 +345,13 @@ func unstorable(r *http.Request, resp *http.Response, cc cache.Directives, maxOb
 	return ""
 }
 
-func (h *Handler) notStored(r *http.Request, rt *Route, why string) {
+func (h *Handler) notStored(r *http.Request, an *Annotations, why string) {
 	if !h.log.Enabled(r.Context(), slog.LevelDebug) {
 		return
 	}
 	h.log.LogAttrs(r.Context(), slog.LevelDebug, "response not stored",
-		slog.String("host", r.Host), slog.String("path", r.URL.Path), slog.String("route", rt.Name), slog.String("reason", why))
+		slog.String("request_id", an.RequestID), slog.String("host", r.Host), slog.String("path", r.URL.Path),
+		slog.String("route", an.Route.Name), slog.String("reason", why))
 }
 
 // serveEntry answers r from e, applying the route's response rules, which

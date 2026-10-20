@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	goruntime "runtime"
 	"strings"
 	"sync/atomic"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/MuditGarg007/prism/internal/admin"
 	"github.com/MuditGarg007/prism/internal/config"
+	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/runtime"
 	"github.com/MuditGarg007/prism/internal/server"
 )
@@ -53,15 +56,17 @@ func startProxyLogged(t *testing.T, body string, logs io.Writer) string {
 
 // launch runs prism from body, as main does, with its admin API when body
 // configures one. It is shut down like startProxy's.
-func launch(t *testing.T, body string, logs io.Writer) *server.Server {
+func launch(t *testing.T, body string, logs io.Writer) *instance {
 	t.Helper()
-	yaml := "listeners: [{ addr: \"127.0.0.1:0\" }]\n" + body
-	cfg, err := config.Parse([]byte(yaml), "")
+	path := filepath.Join(t.TempDir(), "prism.yaml")
+	writeConfig(t, path, body)
+	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(logs, nil))
-	rt, err := runtime.Build(cfg, log)
+	metrics := observability.NewMetrics()
+	rt, err := runtime.Build(cfg, log, runtime.Options{Metrics: metrics})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,8 +76,9 @@ func launch(t *testing.T, body string, logs io.Writer) *server.Server {
 		rt.Close()
 		t.Fatal(err)
 	}
+	reloader := runtime.NewReloader(path, cur, metrics, srv.ReloadCerts, log)
 	if a := cfg.Admin; a != nil {
-		srv.Admin(a.Listen, admin.New(cur, log))
+		srv.Admin(a.Listen, admin.New(cur, metrics, reloader.Reload, log))
 	}
 	if err := srv.Start(); err != nil {
 		rt.Close()
@@ -85,9 +91,25 @@ func launch(t *testing.T, body string, logs io.Writer) *server.Server {
 		if err := srv.Shutdown(ctx); err != nil {
 			t.Errorf("shutdown: %v", err)
 		}
-		rt.Close()
+		cur.Load().Close()
 	})
-	return srv
+	return &instance{Server: srv, path: path}
+}
+
+// instance is a running prism and its config file.
+type instance struct {
+	*server.Server
+	path string
+}
+
+// writeConfig writes body, a config with everything but the listeners, to
+// path, with a listener on a free loopback port.
+func writeConfig(t *testing.T, path, body string) {
+	t.Helper()
+	yaml := "listeners: [{ addr: \"127.0.0.1:0\" }]\n" + body
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // startBackend runs h on a loopback server that is closed when the test
