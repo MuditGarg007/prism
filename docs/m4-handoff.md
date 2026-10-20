@@ -1,6 +1,6 @@
 # M4 handoff
 
-As of 2026-10-20, M4 (caching) is complete: all 10 steps are done, the exit test passes end to end (1,000 concurrent requests for a cold key make exactly 1 upstream request), and `make lint test validate` passes with `-race`. Nothing is committed yet; commit only when the user asks. Next is M5 (operations).
+As of 2026-10-20, M4 (caching) is complete: all 10 steps are done, the exit test passes end to end (1,000 concurrent requests for a cold key make exactly 1 upstream request), and `make lint test validate` passes with `-race`. It is committed as `b2416f9` and pushed to main. Next is M5 (operations).
 
 - The repo lives at `/home/mudit/prism`. The module is `github.com/MuditGarg007/prism`, on Go 1.27.
 - M4 builds on `6f22412` (M3 plus its docs commit).
