@@ -223,6 +223,17 @@ Build these together.
 - WebSocket: detect `Upgrade`, hijack, run a bidirectional copy, and apply idle timeouts.
 - HTTP/2 comes for free on TLS listeners; h2c is optional. OpenTelemetry tracing (W3C `traceparent` propagation) is a bonus.
 
+**Status:** done on 2026-10-20. The decisions and details are in `docs/m6-handoff.md`. As built:
+
+- IP allow/deny lists at the top level (before routing) and per route, on the client IP after `trusted_proxies`. Refusals get 403.
+- Per-route auth: Basic with bcrypt hashes (a dummy hash for unknown users, verified passwords remembered for 5 minutes, bcrypt work capped at GOMAXPROCS), API keys looked up by SHA-256 digest, or either one. Checked credentials are stripped unless forwarded, and an optional identity header tells the backend who was let in. `GET /config` shows user and key names but no hashes. Build warns about a password route without a rate limit.
+- Canary: a sticky split by client IP in 10,000 buckets, so raising the percent only adds clients, with `always`/`never` header and cookie overrides. Canary requests skip the cache and have their own metric series.
+- Shadow: one copy per request that reaches a backend, sent on its own goroutine under its own timeout and concurrency cap, with the body copied from memory or captured as it streams. `TestProxyShadowAddsNoLatency` and the e2e `TestShadowAddsNoLatency` check that it never slows the real request.
+- WebSockets, opt-in per route: the upgrade is forwarded, the connection hijacked and tracked so a shutdown waits for it and closes it at the deadline, bytes copied both ways under one idle timer, and the route's concurrency slot held for the connection's life.
+- HTTP/2 on TLS listeners, tested for streaming, trailers, streamed uploads and cancellation, and `h2c: true` for prior-knowledge HTTP/2 on plain listeners. Backends stay on HTTP/1.1.
+- Hand-written W3C `traceparent` propagation (no OpenTelemetry SDK): Prism joins or starts a trace, sends its own span as the parent of every backend request, and logs `trace_id`, `span_id` and `parent_id`.
+- The exit tests are in `test/e2e/m6_test.go`: the canary split and overrides, shadow latency, the auth matrix, WebSocket echo, idle cutoff and shutdown, and HTTP/2 over TLS and h2c with trailers and trace propagation.
+
 ### M7: Benchmarks and write-up (1 week)
 
 - Use k6 or vegeta to compare a direct backend, Prism and nginx on the same machine. Report p50/p99 added latency, requests per second, and allocations per request (`go test -bench -benchmem`, pprof).

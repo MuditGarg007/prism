@@ -15,6 +15,9 @@
 # example a load balancer in front of Prism). From anyone else, those
 # headers are replaced: every request gets a new X-Request-Id, sent to the
 # backend and the client and logged as request_id.
+# A W3C traceparent is accepted from anyone: Prism joins that trace (or
+# starts one), sends its own span as the parent to the backend, and logs
+# trace_id, span_id and parent_id.
 trusted_proxies: ["10.0.0.0/8", "127.0.0.1"]
 forwarded_header: false           # also send an RFC 7239 Forwarded header
 
@@ -35,10 +38,19 @@ cache: { max_size: 64MB }
 # and GET /cache/stats. Keep it on loopback; it has no authentication.
 admin: { listen: "127.0.0.1:9901" }
 
+# Refuses requests by client IP (after trusted_proxies) with 403, before
+# routing. deny wins; when allow is set, only clients in it get through.
+# Routes can have their own access block too, checked after matching.
+access: { deny: ["192.0.2.0/24"] }
+
 listeners:
   - addr: ":8080"
     timeouts: { read_header: 10s, idle: 120s }
-  # TLS listener. Cert paths are relative to this file and must exist.
+    # Also serve HTTP/2 without TLS to clients that start with it (prior
+    # knowledge, such as gRPC). Backends are always reached over HTTP/1.1.
+    h2c: true
+  # TLS listener, which negotiates HTTP/2 by itself. Cert paths are
+  # relative to this file and must exist.
   # - addr: ":8443"
   #   tls: { certs: [{ cert: certs/a.pem, key: certs/a.key }] }
 
@@ -60,6 +72,11 @@ upstreams:
     outlier: { consecutive_failures: 5, base_ejection: 30s, max_ejection: 300s, max_ejection_percent: 50 }
     timeouts: { connect: 2s, response_header: 10s, idle_conn: 90s }
     max_idle_conns_per_host: 64
+
+  # The next version of api, for the canary and shadow below.
+  api-v2:
+    backends:
+      - { url: "http://10.0.0.3:8080" }
 
   static:
     backends:
@@ -100,6 +117,40 @@ routes:
       lock_timeout: 5s
       stale_if_error: 30s
       bypass_header: X-Cache-Bypass
+    # Requests need a user and password (Basic) or an API key; either one
+    # will do. Passwords are bcrypt hashes ("htpasswd -nbB user password"),
+    # keys sha256 digests ("printf %s key | sha256sum"). Failures get 401.
+    # The checked credentials are removed before forwarding unless
+    # forward_credentials is set, and identity_header tells the backend who
+    # was let in. Rate limits apply before auth, so they also cap password
+    # guessing. A cached response is shared between authenticated clients
+    # only when it is public, s-maxage or must-revalidate.
+    # The example user is alice with password s3cret, the key is key-one.
+    auth:
+      basic:
+        realm: api
+        users: { alice: "$2a$10$7PTiybTg/fasyyDtp5gxKO.dwkbXmCniNwUPJz/LHRnxoqhi4pe/6" }
+      api_keys:
+        header: X-API-Key
+        keys: { ci: "sha256:9b346041bc9a49574eb2665b2ad2a0a3f9f9cce4e42f5d1f26deb8a256b5966a" }
+      identity_header: X-Auth-User
+    # Sends percent of clients to api-v2, each client always to the same
+    # side (hashed by IP). A header or cookie set to "always" or "never"
+    # picks the side for one request. Canary responses are never cached.
+    canary: { upstream: api-v2, percent: 5, header: X-Canary, cookie: canary }
+    # Also sends a copy of percent of the requests that reach a backend to
+    # api-v2, and discards its response. Copies never slow the real request:
+    # bodies over max_body or of unknown length are not copied, and copies
+    # beyond max_concurrency are dropped. They carry X-Prism-Shadow: 1.
+    shadow: { upstream: api-v2, percent: 10, max_body: 64KB, max_concurrency: 16, timeout: 5s }
+
+  # WebSockets are refused (the upgrade headers are dropped) unless a route
+  # has a websocket block. An upgraded connection keeps its concurrency slot
+  # until it closes, and is closed after idle_timeout with no data either
+  # way, or at the shutdown deadline. It skips the cache and the shadow.
+  - match: { path_prefix: "/live/" }
+    upstream: api
+    websocket: { idle_timeout: 5m }
 
   - match: { path_prefix: "/" }
     upstream: static

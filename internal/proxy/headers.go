@@ -51,10 +51,14 @@ func cleanRequestHeaders(h http.Header) {
 	}
 }
 
-func wantsTrailers(h http.Header) bool {
-	for _, v := range h["Te"] {
-		for tok := range strings.SplitSeq(v, ",") {
-			if strings.EqualFold(textproto.TrimString(tok), "trailers") {
+func wantsTrailers(h http.Header) bool { return hasToken(h["Te"], "trailers") }
+
+// hasToken reports whether the comma-separated values vv list tok, ignoring
+// case.
+func hasToken(vv []string, tok string) bool {
+	for _, v := range vv {
+		for t := range strings.SplitSeq(v, ",") {
+			if strings.EqualFold(textproto.TrimString(t), tok) {
 				return true
 			}
 		}

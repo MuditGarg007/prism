@@ -116,18 +116,22 @@ routes:
 
 // TestReloadKeepsRouteState checks which per-route state a reload keeps,
 // matched by route name, and that the cache is always kept.
+// testHash is a bcrypt hash of "s3cret" at the lowest cost.
+const testHash = "$2a$04$2Waq0k1CQGjrchXQb2AjfOg3u7OIuziqivVBEfq8R8TWIsZG3IYrC"
+
 func TestReloadKeepsRouteState(t *testing.T) {
 	type knobs struct {
-		host, rate, budget, maxSize string
-		conc, queue                 int
+		host, rate, budget, maxSize, realm string
+		conc, queue, shadowConc            int
 	}
-	base := knobs{host: "a.test", rate: "10/s", budget: "0.2", maxSize: "1MB", conc: 4, queue: 2}
+	base := knobs{host: "a.test", rate: "10/s", budget: "0.2", maxSize: "1MB", realm: "api", conc: 4, queue: 2, shadowConc: 8}
 	cfg := func(k knobs) *config.Config {
 		return parse(t, fmt.Sprintf(`
 listeners: [{ addr: ":8080" }]
 cache: { max_size: %s }
 upstreams:
   web: { backends: [{ url: "http://127.0.0.1:9000" }] }
+  v2: { backends: [{ url: "http://127.0.0.1:9001" }] }
 routes:
   - match: { host: %s, path_prefix: /api/ }
     upstream: web
@@ -136,20 +140,25 @@ routes:
     queue_size: %d
     retry: { attempts: 1, budget_ratio: %s }
     cache: { enabled: true }
-`, k.maxSize, k.host, k.rate, k.conc, k.queue, k.budget), "")
+    auth: { basic: { realm: %s, users: { alice: "%s" } } }
+    shadow: { upstream: v2, max_concurrency: %d }
+`, k.maxSize, k.host, k.rate, k.conc, k.queue, k.budget, k.realm, testHash, k.shadowConc), "")
 	}
 	tests := []struct {
 		name                     string
 		change                   func(k *knobs)
 		limiter, sem, budget, rt bool // kept; rt is whether the route is matched at all
+		auth, shadowSlots        bool
 	}{
-		{"unchanged", func(k *knobs) {}, true, true, true, true},
-		{"rate changed", func(k *knobs) { k.rate = "20/s" }, false, true, true, true},
-		{"concurrency changed", func(k *knobs) { k.conc = 8 }, true, false, true, true},
-		{"queue changed", func(k *knobs) { k.queue = 3 }, true, false, true, true},
-		{"budget changed", func(k *knobs) { k.budget = "0.5" }, true, true, false, true},
-		{"cache resized", func(k *knobs) { k.maxSize = "2MB" }, true, true, true, true},
-		{"renamed", func(k *knobs) { k.host = "b.test" }, false, false, false, false},
+		{"unchanged", func(k *knobs) {}, true, true, true, true, true, true},
+		{"rate changed", func(k *knobs) { k.rate = "20/s" }, false, true, true, true, true, true},
+		{"concurrency changed", func(k *knobs) { k.conc = 8 }, true, false, true, true, true, true},
+		{"queue changed", func(k *knobs) { k.queue = 3 }, true, false, true, true, true, true},
+		{"budget changed", func(k *knobs) { k.budget = "0.5" }, true, true, false, true, true, true},
+		{"cache resized", func(k *knobs) { k.maxSize = "2MB" }, true, true, true, true, true, true},
+		{"realm changed", func(k *knobs) { k.realm = "other" }, true, true, true, true, false, true},
+		{"shadow cap changed", func(k *knobs) { k.shadowConc = 9 }, true, true, true, true, true, false},
+		{"renamed", func(k *knobs) { k.host = "b.test" }, false, false, false, false, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -163,6 +172,12 @@ routes:
 			}
 			if got := r1.Concurrency == r2.Concurrency; got != tt.sem {
 				t.Errorf("semaphore kept = %v, want %v", got, tt.sem)
+			}
+			if got := r1.Shadow.Slots == r2.Shadow.Slots; got != tt.shadowSlots {
+				t.Errorf("shadow slots kept = %v, want %v", got, tt.shadowSlots)
+			}
+			if got := r1.Auth == r2.Auth; got != tt.auth {
+				t.Errorf("authenticator kept = %v, want %v", got, tt.auth)
 			}
 			if got := r1.Retry.Budget == r2.Retry.Budget; got != tt.budget {
 				t.Errorf("budget kept = %v, want %v", got, tt.budget)

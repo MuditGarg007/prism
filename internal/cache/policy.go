@@ -30,14 +30,15 @@ func storableStatus(code int) bool {
 	return code == http.StatusOK || code == http.StatusMovedPermanently || code == http.StatusNotFound
 }
 
-// Storable returns why the response to a GET request with header req, which
-// has status code and header h and the directives cc, must not be stored, or
-// "" if it may be.
+// Storable returns why the response to a GET request, which has status code
+// and header h and the directives cc, must not be stored, or "" if it may
+// be. authenticated says whether the request carried credentials: an
+// Authorization header, or ones the proxy checked itself.
 //
 // Freshness must be explicit. A response with none, which RFC 9111 would let
 // a cache give a heuristic lifetime, is not stored: guessing how long a
 // backend meant a response to live is how stale pages get served.
-func Storable(req http.Header, code int, h http.Header, cc Directives) string {
+func Storable(authenticated bool, code int, h http.Header, cc Directives) string {
 	switch {
 	case !storableStatus(code):
 		return "status"
@@ -50,7 +51,7 @@ func Storable(req http.Header, code int, h http.Header, cc Directives) string {
 		return "set-cookie"
 	case varyAll(h):
 		return "vary"
-	case req.Get("Authorization") != "" && !cc.Public && cc.SMaxAge == Absent && !cc.MustRevalidate:
+	case authenticated && !cc.Public && cc.SMaxAge == Absent && !cc.MustRevalidate:
 		// RFC 9111 §3.5: a response to an authenticated request is for that
 		// user only, unless the backend says otherwise.
 		return "authorization"

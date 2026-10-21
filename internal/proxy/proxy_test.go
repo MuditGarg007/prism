@@ -128,7 +128,7 @@ func newHandler(t testing.TB, u *config.Upstream, rt *Route, log *slog.Logger, t
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewHandler(table, NewForwarding(trusted, false), nil, log)
+	return NewHandler(table, NewForwarding(trusted, false), nil, nil, log)
 }
 
 // serve starts a server for h and returns its URL.

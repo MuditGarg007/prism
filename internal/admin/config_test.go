@@ -67,6 +67,8 @@ func TestConfig(t *testing.T) {
 		{[]any{"routes", 2, "headers", "request_set"}, map[string]any{"X-A": "1", "X-B": "2"}},
 		{[]any{"routes", 2, "headers", "request_remove"}, []any{}},
 		{[]any{"routes", 2, "retry"}, nil},
+		{[]any{"routes", 2, "websocket", "idle_timeout"}, "1m30s"},
+		{[]any{"routes", 2, "auth", "api_keys", "header"}, "X-API-Key"},
 	}
 	for _, tt := range tests {
 		if got := path(tt.keys...); !reflect.DeepEqual(got, tt.want) {
@@ -75,6 +77,12 @@ func TestConfig(t *testing.T) {
 	}
 	if strings.Contains(body, "hunter2") {
 		t.Error("the backend's password is in the body")
+	}
+	if strings.Contains(body, "$2a$") || strings.Contains(body, "sha256:") {
+		t.Error("a password hash or key digest is in the body")
+	}
+	if !strings.Contains(body, `"alice"`) || !strings.Contains(body, `"ci"`) {
+		t.Error("user and key names are missing from the body")
 	}
 	// Field order follows the struct, so the file reads top to bottom.
 	if i, j := strings.Index(body, `"trusted_proxies"`), strings.Index(body, `"admin"`); i != 1 || j < i {
@@ -96,7 +104,9 @@ func TestEncodeConfigRedact(t *testing.T) {
 		Skipped  string   `yaml:"-"`
 		Default  int
 		hidden   int
-		Wait     time.Duration `yaml:"wait,omitempty"`
+		Wait     time.Duration     `yaml:"wait,omitempty"`
+		Users    map[string]string `yaml:"users" redact:"values"`
+		NoUsers  map[string]string `yaml:"no_users" redact:"values"`
 	}
 	v := creds{
 		User:     "alice",
@@ -108,13 +118,15 @@ func TestEncodeConfigRedact(t *testing.T) {
 		Default:  7,
 		hidden:   1,
 		Wait:     1500 * time.Millisecond,
+		Users:    map[string]string{"bob": "$2a$hash", "alice": "$2a$hash"},
 	}
 	var buf bytes.Buffer
 	if err := encodeConfig(&buf, reflect.ValueOf(&v)); err != nil {
 		t.Fatal(err)
 	}
 	want := `{"user":"alice","password":"[redacted]","keys":"[redacted]","token":"",` +
-		`"url":"https://bob:xxxxx@example.com/x","bad":"[redacted]","default":7,"wait":"1.5s"}`
+		`"url":"https://bob:xxxxx@example.com/x","bad":"[redacted]","default":7,"wait":"1.5s",` +
+		`"users":{"alice":"[redacted]","bob":"[redacted]"},"no_users":{}}`
 	if buf.String() != want {
 		t.Errorf("got  %s\nwant %s", &buf, want)
 	}

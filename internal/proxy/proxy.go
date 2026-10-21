@@ -20,6 +20,7 @@ import (
 	"github.com/MuditGarg007/prism/internal/ratelimit"
 	"github.com/MuditGarg007/prism/internal/resilience"
 	"github.com/MuditGarg007/prism/internal/router"
+	"github.com/MuditGarg007/prism/internal/security"
 	"github.com/MuditGarg007/prism/internal/upstream"
 )
 
@@ -32,19 +33,29 @@ type Route struct {
 	PreserveHost bool
 	Request      HeaderOps
 	Response     HeaderOps
-	RateLimit    *ratelimit.Limiter // per client IP; nil for none
-	MaxBody      int64              // request body limit in bytes; 0 for none
-	Concurrency  *limits.Semaphore  // requests served at once; nil for no cap
-	QueueTimeout time.Duration      // longest wait for a Concurrency slot
-	Retry        *resilience.Retry  // nil for no retries
-	Cache        *Cache             // nil when the route does not cache
+	RateLimit    *ratelimit.Limiter      // per client IP; nil for none
+	MaxBody      int64                   // request body limit in bytes; 0 for none
+	Concurrency  *limits.Semaphore       // requests served at once; nil for no cap
+	QueueTimeout time.Duration           // longest wait for a Concurrency slot
+	Retry        *resilience.Retry       // nil for no retries
+	Cache        *Cache                  // nil when the route does not cache
+	Access       *security.IPFilter      // checked after matching; nil for none
+	Auth         *security.Authenticator // nil for no authentication
+	Canary       *Canary                 // nil for no canary
+	Shadow       *Shadow                 // nil for no shadow copies
+	// WebSocketIdle closes an upgraded connection once nothing has moved
+	// either way for this long. 0 means the route does not upgrade.
+	WebSocketIdle time.Duration
 	// Metrics are the route's metric handles; nil records nothing.
 	Metrics *observability.RouteMetrics
 }
 
 // Annotations record how the proxy handled one request, for the access log.
 type Annotations struct {
-	Route    *Route
+	Route *Route
+	// Pool is the upstream the request goes to: the route's, or its
+	// canary's.
+	Pool     *upstream.Pool
 	Backend  *upstream.Backend
 	ClientIP netip.Addr
 	Attempts int    // backends tried, counting the first
@@ -57,6 +68,20 @@ type Annotations struct {
 	// RequestID is the ID sent to the backend and the client in
 	// X-Request-Id.
 	RequestID string
+	// Trace is the request's W3C trace, sent on to the backend in
+	// traceparent.
+	Trace Trace
+	// User is the user or API key name the route's auth let in, or "".
+	User string
+	// WebSocket is set when the client asked for a WebSocket on a route
+	// that allows them.
+	WebSocket bool
+	// Upgraded is set once the backend accepted the upgrade. Tunnel is how
+	// long the connection then stayed open, and BytesUp and BytesDown are
+	// the bytes copied to the backend and to the client.
+	Upgraded           bool
+	Tunnel             time.Duration
+	BytesUp, BytesDown int64
 	// Metrics are the handles to record the request with: its route's, or
 	// the unmatched ones.
 	Metrics *observability.RouteMetrics
@@ -75,15 +100,17 @@ type Annotated interface {
 type Handler struct {
 	routes    *router.Table[*Route]
 	fwd       *Forwarding
+	access    *security.IPFilter
 	unmatched *observability.RouteMetrics
 	log       *slog.Logger
 }
 
 // NewHandler returns a Handler that matches requests against routes and
-// reports forwarding failures to log. Requests that match no route are
+// reports forwarding failures to log. Clients that access refuses get 403
+// before routing; access may be nil. Requests that match no route are
 // recorded with unmatched, which may be nil.
-func NewHandler(routes *router.Table[*Route], fwd *Forwarding, unmatched *observability.RouteMetrics, log *slog.Logger) *Handler {
-	return &Handler{routes: routes, fwd: fwd, unmatched: unmatched, log: log}
+func NewHandler(routes *router.Table[*Route], fwd *Forwarding, access *security.IPFilter, unmatched *observability.RouteMetrics, log *slog.Logger) *Handler {
+	return &Handler{routes: routes, fwd: fwd, access: access, unmatched: unmatched, log: log}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -96,7 +123,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Set first, so every response carries it, a rejection included.
 	an.RequestID = h.requestID(r.Header, peer)
 	w.Header()[RequestIDHeader] = []string{an.RequestID}
+	an.Trace = newTrace(r.Header)
 	an.Metrics = h.unmatched
+	if h.access != nil && !h.access.Allowed(an.ClientIP) {
+		reject(w, an, http.StatusForbidden, kindForbidden, 0)
+		return
+	}
 
 	// The router matches the path as given, and backends may normalize it,
 	// so "/public/../admin" would match /public/ and be served as /admin.
@@ -111,12 +143,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	an.Route = rt
+	an.Pool = rt.Pool
 	an.Metrics = rt.Metrics
+	if rt.Access != nil && !rt.Access.Allowed(an.ClientIP) {
+		reject(w, an, http.StatusForbidden, kindForbidden, 0)
+		return
+	}
 	if rt.RateLimit != nil {
 		if ok, wait := rt.RateLimit.Allow(an.ClientIP); !ok {
 			reject(w, an, http.StatusTooManyRequests, kindRateLimited, wait)
 			return
 		}
+	}
+	// After the rate limit, so the limit also caps password guessing and
+	// the bcrypt work it costs.
+	if a := rt.Auth; a != nil {
+		user, err := a.Check(r)
+		if err != nil {
+			if r.Context().Err() != nil {
+				h.fail(w, r, rt, nil, an, err) // the client left while waiting
+				return
+			}
+			if c := a.Challenge(); c != "" {
+				w.Header().Set("WWW-Authenticate", c)
+			}
+			reject(w, an, http.StatusUnauthorized, kindUnauthorized, 0)
+			return
+		}
+		an.User = user
 	}
 	if rt.MaxBody > 0 {
 		// A declared length over the limit is refused before reading
@@ -133,10 +187,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r.Body = http.MaxBytesReader(w, r.Body, rt.MaxBody)
 		}
 	}
+	an.WebSocket = rt.WebSocketIdle > 0 && isWebSocket(r)
+	canary := rt.Canary != nil && rt.Canary.pick(r, an.ClientIP)
+	if canary {
+		an.Pool = rt.Canary.Pool
+		an.Metrics = rt.Canary.Metrics
+	}
 	// The cache comes before the concurrency slot: hits and requests
 	// waiting for another's fetch put no load on a backend, so only a
-	// request that goes to one takes a slot.
-	if c := rt.Cache; c != nil && cacheable(r) {
+	// request that goes to one takes a slot. The canary skips the cache,
+	// so its responses are neither stored for nor served from the
+	// primary's. Nor is a WebSocket ever a cached response.
+	if c := rt.Cache; c != nil && !canary && !an.WebSocket && cacheable(r) {
 		h.serveCache(w, r, rt, c, an)
 		return
 	}
@@ -144,7 +206,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Held until forward returns, which is after the whole response body
-	// is copied: a slow stream is still load on the backend.
+	// is copied, or a WebSocket closes: a slow stream is still load on the
+	// backend.
 	defer release(rt)
 	h.forward(w, r, rt, an)
 }
@@ -202,6 +265,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, rt *Route, an 
 		return
 	}
 	defer f.release()
+	if f.resp.StatusCode == http.StatusSwitchingProtocols {
+		h.tunnel(w, r, rt, an, &f)
+		return
+	}
 	h.write(w, r, rt, an, &f, f.resp.Body)
 }
 
@@ -212,6 +279,8 @@ type fetched struct {
 	b    *upstream.Backend
 	adm  upstream.Admission
 	out  resilience.Outcome
+	// upgrade is the protocol a 101 switched to, from its Upgrade header.
+	upgrade string
 }
 
 func (f *fetched) release() {
@@ -235,11 +304,21 @@ func (h *Handler) fetch(r *http.Request, rt *Route, an *Annotations) (fetched, *
 	if err != nil {
 		return fetched{}, &fetchError{err: err, clientBody: true}
 	}
+	// One copy per request, not per attempt. A body already in memory is
+	// copied at once; a streamed one only once this request is done with
+	// it. A WebSocket is never copied: there is no response to throw away.
+	if !an.WebSocket && shadowFor(r, rt, &body) {
+		if body.read == nil {
+			h.sendShadow(r, rt, an, &body)
+		} else {
+			defer h.sendShadow(r, rt, an, &body)
+		}
+	}
 	if p := rt.Retry; p != nil && p.Budget != nil {
 		p.Budget.Request()
 	}
 	choice := upstream.Choice{ClientIP: an.ClientIP}
-	b, adm, err := pick(rt.Pool, &choice)
+	b, adm, err := pick(an.Pool, &choice)
 	if err != nil {
 		return fetched{}, &fetchError{err: err}
 	}
@@ -253,7 +332,7 @@ func (h *Handler) fetch(r *http.Request, rt *Route, an *Annotations) (fetched, *
 		b.Acquire()
 		start := time.Now()
 		// RoundTrip, not http.Client, so redirects go back to the client.
-		resp, err = b.Transport.RoundTrip(h.outgoing(r, rt, b, &body, an.RequestID))
+		resp, err = b.Transport.RoundTrip(h.outgoing(r, rt, b, &body, an))
 		if err == nil && b.Latency != nil {
 			b.Latency.Observe(time.Since(start).Seconds())
 		}
@@ -285,11 +364,23 @@ func (h *Handler) fetch(r *http.Request, rt *Route, an *Annotations) (fetched, *
 		var mbe *http.MaxBytesError
 		return fetched{}, &fetchError{b: b, err: err, clientBody: body.clientFailed() && !errors.As(err, &mbe)}
 	}
+	var upgrade string
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		if !an.WebSocket {
+			// Nothing but tunnel can answer a 101, and the backend was not
+			// asked for one.
+			resp.Body.Close()
+			b.Overturn(adm)
+			b.Release()
+			return fetched{}, &fetchError{b: b, err: errBadUpgrade}
+		}
+		upgrade = resp.Header.Get("Upgrade")
+	}
 	removeHopByHop(resp.Header)
 	// The client gets this request's ID, not one the backend echoes back,
 	// and the cache never stores one request's ID to send with another.
 	delete(resp.Header, RequestIDHeader)
-	return fetched{resp: resp, b: b, adm: adm, out: out}, nil
+	return fetched{resp: resp, b: b, adm: adm, out: out, upgrade: upgrade}, nil
 }
 
 // fetchFailed answers a request that fetch got no response for.
@@ -408,7 +499,7 @@ func (h *Handler) retryTarget(r *http.Request, rt *Route, an *Annotations, body 
 		return nil, upstream.Admission{}
 	}
 	choice.Tried = append(choice.Tried, b)
-	next, adm, err := pick(rt.Pool, choice)
+	next, adm, err := pick(an.Pool, choice)
 	if err != nil {
 		return nil, upstream.Admission{}
 	}
@@ -430,13 +521,23 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// outgoing builds the request with ID id to send to b. Its context is r's,
-// so a client that disconnects cancels the backend request too.
-func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend, rb *requestBody, id string) *http.Request {
+// outgoing builds the request to send to b for r, which an describes. Its
+// context is r's, so a client that disconnects cancels the backend request
+// too.
+func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend, rb *requestBody, an *Annotations) *http.Request {
 	hdr := r.Header.Clone()
 	cleanRequestHeaders(hdr)
+	if an.WebSocket {
+		// The one hop-by-hop request Prism passes on, by asking for it again.
+		hdr["Connection"] = []string{"Upgrade"}
+		hdr["Upgrade"] = []string{"websocket"}
+	}
 	h.fwd.Apply(hdr, PeerAddr(r.RemoteAddr), r.Host, r.TLS != nil)
-	hdr[RequestIDHeader] = []string{id}
+	hdr[RequestIDHeader] = []string{an.RequestID}
+	an.Trace.propagate(hdr)
+	if rt.Auth != nil {
+		rt.Auth.Prepare(hdr, an.User)
+	}
 	rt.Request.Apply(hdr)
 
 	host := b.URL.Host

@@ -79,10 +79,16 @@ type readCounter struct {
 	r      io.Reader
 	n      atomic.Int64 // the transport reads on its own goroutine
 	failed atomic.Bool  // a read returned an error other than io.EOF
+
+	shadow   *shadowCapture         // nil unless the body is copied for a shadow
+	captured atomic.Pointer[[]byte] // the whole body, once shadow has it
 }
 
 func (c *readCounter) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
+	if c.shadow != nil && n > 0 {
+		c.keep(p[:n])
+	}
 	c.n.Add(int64(n))
 	if err != nil && err != io.EOF {
 		c.failed.Store(true)

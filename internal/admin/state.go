@@ -4,6 +4,8 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+
+	"github.com/MuditGarg007/prism/internal/config"
 )
 
 // Routes is the body of GET /routes.
@@ -20,7 +22,34 @@ type RouteInfo struct {
 	Upstream   string `json:"upstream"`
 	Cache      bool   `json:"cache"`
 	// Concurrency is set only for routes with max_concurrency.
-	Concurrency *Concurrency `json:"concurrency,omitempty"`
+	Concurrency *Concurrency   `json:"concurrency,omitempty"`
+	Access      *config.Access `json:"access,omitempty"`
+	// Auth lists the credentials the route takes: "basic", "api_keys" or
+	// both. Users and keys are in GET /config, without their hashes.
+	Auth      []string       `json:"auth,omitempty"`
+	Canary    *CanaryInfo    `json:"canary,omitempty"`
+	Shadow    *ShadowInfo    `json:"shadow,omitempty"`
+	WebSocket *WebSocketInfo `json:"websocket,omitempty"`
+}
+
+type CanaryInfo struct {
+	Upstream string  `json:"upstream"`
+	Percent  float64 `json:"percent"`
+	Header   string  `json:"header,omitempty"`
+	Cookie   string  `json:"cookie,omitempty"`
+}
+
+// ShadowInfo is a route's shadow, with its copies in flight against its
+// max_concurrency.
+type ShadowInfo struct {
+	Upstream string  `json:"upstream"`
+	Percent  float64 `json:"percent"`
+	InFlight int     `json:"in_flight"`
+	Limit    int     `json:"limit"`
+}
+
+type WebSocketInfo struct {
+	IdleTimeout string `json:"idle_timeout"`
 }
 
 // Concurrency is a route's live use of its max_concurrency.
@@ -45,6 +74,26 @@ func (h *Handler) routes(w http.ResponseWriter, r *http.Request) {
 		}
 		if s := route.Concurrency; s != nil {
 			info.Concurrency = &Concurrency{InUse: s.InUse(), Limit: s.Cap(), Queued: s.Waiting()}
+		}
+		cr := &rt.Config.Routes[i]
+		info.Access = cr.Access
+		if a := cr.Auth; a != nil {
+			if a.Basic != nil {
+				info.Auth = append(info.Auth, "basic")
+			}
+			if a.APIKeys != nil {
+				info.Auth = append(info.Auth, "api_keys")
+			}
+		}
+		if c := cr.Canary; c != nil {
+			info.Canary = &CanaryInfo{Upstream: c.Upstream, Percent: c.Percent, Header: c.Header, Cookie: c.Cookie}
+		}
+		if sh := cr.Shadow; sh != nil {
+			slots := route.Shadow.Slots
+			info.Shadow = &ShadowInfo{Upstream: sh.Upstream, Percent: sh.Percent, InFlight: slots.InUse(), Limit: slots.Cap()}
+		}
+		if ws := cr.WebSocket; ws != nil {
+			info.WebSocket = &WebSocketInfo{IdleTimeout: ws.IdleTimeout.String()}
 		}
 		out.Routes[i] = info
 	}

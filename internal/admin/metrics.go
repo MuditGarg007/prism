@@ -29,9 +29,10 @@ var (
 	upstreamAvailable = desc("prism_upstream_available_backends",
 		"Backends that may be picked: healthy, not ejected and breaker not open.", "upstream")
 
-	routeInUse = desc("prism_route_concurrency_in_use", "Concurrency slots taken, for routes with max_concurrency.", "route")
-	routeLimit = desc("prism_route_concurrency_limit", "The route's max_concurrency.", "route")
-	routeQueue = desc("prism_route_queue_depth", "Requests waiting for a concurrency slot.", "route")
+	routeInUse     = desc("prism_route_concurrency_in_use", "Concurrency slots taken, for routes with max_concurrency.", "route")
+	routeLimit     = desc("prism_route_concurrency_limit", "The route's max_concurrency.", "route")
+	routeQueue     = desc("prism_route_queue_depth", "Requests waiting for a concurrency slot.", "route")
+	shadowInFlight = desc("prism_shadow_inflight", "Shadow copies being sent, for routes with a shadow.", "route")
 
 	cacheRequests  = desc("prism_cache_requests_total", "Requests on caching routes, by X-Cache result.", "result")
 	cacheEntries   = desc("prism_cache_entries", "Responses held by the cache.")
@@ -76,6 +77,9 @@ func (c collector) Collect(ch chan<- prometheus.Metric) {
 			gauge(routeInUse, float64(s.InUse()), r.Name)
 			gauge(routeLimit, float64(s.Cap()), r.Name)
 			gauge(routeQueue, float64(s.Waiting()), r.Name)
+		}
+		if sh := r.Shadow; sh != nil {
+			gauge(shadowInFlight, float64(sh.Slots.InUse()), r.Name)
 		}
 	}
 

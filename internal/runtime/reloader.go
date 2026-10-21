@@ -121,7 +121,7 @@ func keepRestartOnly(cur, next *config.Config, log *slog.Logger) {
 // sameListener reports whether a and b differ at most in their certificate
 // pairs.
 func sameListener(a, b config.Listener) bool {
-	return a.Addr == b.Addr && (a.TLS == nil) == (b.TLS == nil) && a.Timeouts == b.Timeouts
+	return a.Addr == b.Addr && (a.TLS == nil) == (b.TLS == nil) && a.Timeouts == b.Timeouts && a.H2C == b.H2C
 }
 
 // series lists the route and backend series that rt records into.
@@ -129,9 +129,16 @@ func (rt *Runtime) series() observability.Series {
 	s := observability.Series{
 		Routes:   map[observability.RouteSeries]bool{},
 		Backends: map[observability.BackendSeries]bool{},
+		Shadows:  map[string]bool{},
 	}
 	for _, r := range rt.Routes {
 		s.Routes[observability.RouteSeries{Route: r.Name, Upstream: r.Pool.Name}] = true
+		if c := r.Canary; c != nil {
+			s.Routes[observability.RouteSeries{Route: r.Name, Upstream: c.Pool.Name}] = true
+		}
+		if r.Shadow != nil {
+			s.Shadows[r.Name] = true
+		}
 	}
 	for name, p := range rt.Pools {
 		for _, b := range p.Backends {

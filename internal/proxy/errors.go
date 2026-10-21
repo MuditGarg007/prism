@@ -31,6 +31,9 @@ const (
 	kindBodyTooLarge errorKind = "body_too_large"
 	kindOverloaded   errorKind = "overloaded"
 	kindClientBody   errorKind = "client_body"
+	kindForbidden    errorKind = "forbidden"
+	kindUnauthorized errorKind = "unauthorized"
+	kindInternal     errorKind = "internal"
 )
 
 // classify maps a forwarding error to the status the client gets. ctx is the
@@ -171,7 +174,7 @@ func (h *Handler) logError(r *http.Request, level slog.Level, msg string, an *An
 		slog.String("method", r.Method),
 		slog.String("host", r.Host),
 		slog.String("path", r.URL.Path),
-		slog.String("upstream", an.Route.Pool.Name),
+		slog.String("upstream", an.Pool.Name),
 	}
 	if b != nil {
 		attrs = append(attrs, slog.String("backend", b.String()))

@@ -110,8 +110,10 @@ func encodeConfig(buf *bytes.Buffer, v reflect.Value) error {
 	return nil
 }
 
-// encodeField writes a struct field, hiding it as its redact tag says. An
-// empty secret is shown as it is, so a reader can tell that none is set.
+// encodeField writes a struct field, hiding it as its redact tag says:
+// "secret" hides the value, "url" a URL's password, and "values" every
+// value of a map but not its keys. An empty secret is shown as it is, so a
+// reader can tell that none is set.
 func encodeField(buf *bytes.Buffer, v reflect.Value, redact string) error {
 	switch {
 	case redact == "secret" && !v.IsZero():
@@ -122,6 +124,21 @@ func encodeField(buf *bytes.Buffer, v reflect.Value, redact string) error {
 			return encodeValue(buf, redacted)
 		}
 		return encodeValue(buf, u.Redacted())
+	case redact == "values" && v.Kind() == reflect.Map && !v.IsNil():
+		// The names stay, so a reader can see who has access.
+		keys := v.MapKeys()
+		slices.SortFunc(keys, func(a, b reflect.Value) int { return strings.Compare(a.String(), b.String()) })
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			encodeValue(buf, k.String())
+			buf.WriteByte(':')
+			encodeValue(buf, redacted)
+		}
+		buf.WriteByte('}')
+		return nil
 	}
 	return encodeConfig(buf, v)
 }

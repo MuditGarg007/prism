@@ -219,6 +219,7 @@ routes:
 	req.Host = "api.test"
 	req.Header.Set("X-Forwarded-For", "203.0.113.9")
 	req.Header.Set("X-Request-Id", "edge-42") // kept from a trusted peer
+	req.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -232,6 +233,7 @@ routes:
 		"status=201", "bytes=5", "duration=",
 		"client=203.0.113.9", // the peer is trusted, so its X-Forwarded-For is used
 		"route=api.test/v1/", "upstream=api", "backend=" + backend.URL, "attempts=1",
+		"trace_id=4bf92f3577b34da6a3ce929d0e0e4736", "span_id=", "parent_id=00f067aa0ba902b7",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("access log %q lacks %q", out, want)
@@ -446,5 +448,111 @@ func TestServerAdmin(t *testing.T) {
 	}
 	if _, err := http.Get(base + "/cache/stats"); err == nil {
 		t.Error("admin listener still serving after Shutdown")
+	}
+}
+
+// TestServerWebSocket runs a WebSocket through the access log's writer: the
+// tunnel is tracked, so Shutdown closes it at the deadline, and the access
+// log reports the upgrade and the bytes each way.
+func TestServerWebSocket(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer c.Close()
+		io.WriteString(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		brw.Flush()
+		io.Copy(c, brw)
+	}))
+	defer backend.Close()
+	cfg, err := config.Parse(fmt.Appendf(nil, `
+listeners: [{ addr: ":8080" }]
+upstreams:
+  ws: { backends: [{ url: %q }] }
+routes:
+  - { match: { path_prefix: / }, upstream: ws, websocket: {} }
+`, backend.URL), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, log := newTestLogger()
+	rt, err := runtime.Build(cfg, log, runtime.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	s, _ := start(t, []config.Listener{plainListener()}, runtime.NewCurrent(rt), log)
+
+	c, err := net.Dial("tcp", s.Addrs()[0].String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(c, "GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake: %v, %v", resp, err)
+	}
+	io.WriteString(c, "hello")
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(br, got); err != nil || string(got) != "hello" {
+		t.Fatalf("echo: %q, %v", got, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.Shutdown(ctx); err == nil || !strings.Contains(err.Error(), "closed 1 hijacked connections") {
+		t.Errorf("Shutdown = %v, want the WebSocket closed at the deadline", err)
+	}
+	if _, err := br.Read(got); err == nil {
+		t.Error("WebSocket still open after Shutdown")
+	}
+	out := logs.waitFor(t, "msg=request")
+	for _, want := range []string{"status=101", "websocket=true", "bytes_up=5", "bytes_down=5"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("access log %q lacks %q", out, want)
+		}
+	}
+}
+
+// TestServerH2C checks that an h2c listener serves HTTP/2 to clients with
+// prior knowledge and HTTP/1 to the rest, and that a plain listener without
+// it refuses HTTP/2.
+func TestServerH2C(t *testing.T) {
+	h2c := plainListener()
+	h2c.H2C = true
+	_, urls := start(t, []config.Listener{h2c, plainListener()}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, r.Proto)
+	}), slog.New(slog.DiscardHandler))
+
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	h2 := &http.Client{Transport: &http.Transport{Protocols: p}}
+	defer h2.CloseIdleConnections()
+	for _, tt := range []struct {
+		client *http.Client
+		url    string
+		want   string // "" for a failed request
+	}{
+		{h2, urls[0], "HTTP/2.0"},
+		{http.DefaultClient, urls[0], "HTTP/1.1"},
+		{h2, urls[1], ""},
+	} {
+		resp, err := tt.client.Get(tt.url)
+		if err != nil {
+			if tt.want != "" {
+				t.Errorf("%s: %v", tt.url, err)
+			}
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != tt.want {
+			t.Errorf("%s: served %q, want %q", tt.url, body, tt.want)
+		}
 	}
 }

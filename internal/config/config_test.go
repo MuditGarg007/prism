@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"errors"
 	"os"
 	"slices"
@@ -151,6 +152,8 @@ func TestParseErrors(t *testing.T) {
 		{"addr without port", `":8080"`, `"8080"`, "listeners[0].addr: invalid address"},
 		{"port out of range", `":8080"`, `":99999"`, "listeners[0].addr: invalid port"},
 		{"missing cert file", `{ addr: ":8080" }`, `{ addr: ":8443", tls: { certs: [{ cert: nope.pem, key: nope.key }] } }`, "no such file"},
+		{"duplicate listener", `{ addr: ":8080" }`, `{ addr: ":8080" }, { addr: ":8080" }`, `listeners[1].addr: duplicate listener address ":8080"`},
+		{"h2c with tls", `{ addr: ":8080" }`, `{ addr: ":8443", h2c: true, tls: { certs: [{ cert: nope.pem, key: nope.key }] } }`, "listeners[0].h2c: is for listeners without TLS"},
 		{"unknown balancer", "    backends:", "    balancer: random\n    backends:", `unknown balancer "random"`},
 		{"bad scheme", "http://127.0.0.1:9000", "ftp://127.0.0.1:9000", "scheme must be http or https"},
 		{"backend with path", "http://127.0.0.1:9000", "http://127.0.0.1:9000/api", "must not have a path"},
@@ -354,4 +357,134 @@ func FuzzParse(f *testing.F) {
 			t.Fatal("nil config without error")
 		}
 	})
+}
+
+// Test credentials: the bcrypt hash is of "s3cret" at the lowest cost, and
+// the digest is of "key-one".
+const (
+	testHash   = "$2a$04$2Waq0k1CQGjrchXQb2AjfOg3u7OIuziqivVBEfq8R8TWIsZG3IYrC"
+	testDigest = "sha256:9b346041bc9a49574eb2665b2ad2a0a3f9f9cce4e42f5d1f26deb8a256b5966a"
+)
+
+// twoUpstreams is minimal with a second upstream, for canary and shadow.
+const twoUpstreams = `
+listeners: [{ addr: ":8080" }]
+upstreams:
+  web:
+    backends: [{ url: "http://127.0.0.1:9000" }]
+  v2:
+    backends: [{ url: "http://127.0.0.1:9001" }]
+routes:
+  - { match: { path_prefix: "/" }, upstream: web }
+`
+
+func TestParseSecurityAndSplits(t *testing.T) {
+	in := strings.Replace(twoUpstreams, `upstream: web }`, `upstream: web,
+      access: { allow: [10.0.0.0/8], deny: [10.0.0.1] },
+      auth: {
+        basic: { users: { alice: "`+testHash+`" } },
+        api_keys: { keys: { ci: "`+testDigest+`" } },
+        identity_header: X-Auth-User },
+      canary: { upstream: v2, percent: 2.5, header: X-Canary, cookie: canary },
+      shadow: { upstream: v2 },
+      websocket: {} }`, 1)
+	in = "access: { deny: [192.0.2.0/24] }\n" + in
+	cfg, err := Parse([]byte(in), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Access.Deny; len(got) != 1 || got[0].String() != "192.0.2.0/24" {
+		t.Errorf("access.deny = %v", got)
+	}
+	r := cfg.Routes[0]
+	if got := r.Access.Deny[0].String(); got != "10.0.0.1/32" {
+		t.Errorf("route deny = %q, want 10.0.0.1/32", got)
+	}
+	if r.Auth.Basic.Realm != defaultRealm || r.Auth.APIKeys.Header != defaultAPIKeyHeader {
+		t.Errorf("auth defaults: realm %q, header %q", r.Auth.Basic.Realm, r.Auth.APIKeys.Header)
+	}
+	if r.Canary.Percent != 2.5 {
+		t.Errorf("canary.percent = %v, want 2.5", r.Canary.Percent)
+	}
+	want := Shadow{Upstream: "v2", Percent: 100, MaxBody: defaultShadowMaxBody, MaxConcurrency: defaultShadowConcurrency, Timeout: defaultShadowTimeout}
+	if *r.Shadow != want {
+		t.Errorf("shadow = %+v, want %+v", *r.Shadow, want)
+	}
+	if r.WebSocket.IdleTimeout != defaultWebSocketIdleTimeout {
+		t.Errorf("websocket.idle_timeout = %v, want %v", r.WebSocket.IdleTimeout, defaultWebSocketIdleTimeout)
+	}
+}
+
+func TestParseSecurityAndSplitErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		new  string // replaces "upstream: web }" in twoUpstreams
+		want string
+	}{
+		{"empty access", `upstream: web, access: {} }`, "routes[0].access: set allow, deny or both"},
+		{"bad access prefix", `upstream: web, access: { allow: [10.0.0.256] } }`, `invalid IP or CIDR "10.0.0.256"`},
+		{"empty auth", `upstream: web, auth: {} }`, "routes[0].auth: set basic, api_keys or both"},
+		{"no users", `upstream: web, auth: { basic: {} } }`, "auth.basic.users: at least one user is required"},
+		{"not bcrypt", `upstream: web, auth: { basic: { users: { alice: plain } } } }`, "auth.basic.users.alice: not a bcrypt hash"},
+		{"colon in user", `upstream: web, auth: { basic: { users: { "a:b": "` + testHash + `" } } } }`, "user name must be non-empty, without colons"},
+		{"quote in realm", `upstream: web, auth: { basic: { realm: "a\"b", users: { alice: "` + testHash + `" } } } }`, "auth.basic.realm: must not contain quotes"},
+		{"no keys", `upstream: web, auth: { api_keys: {} } }`, "auth.api_keys.keys: at least one key is required"},
+		{"bad digest", `upstream: web, auth: { api_keys: { keys: { ci: "sha256:abc" } } } }`, `auth.api_keys.keys.ci: must be "sha256:" followed by 64 hex digits`},
+		{"plain key", `upstream: web, auth: { api_keys: { keys: { ci: key-one } } } }`, "must be \"sha256:\""},
+		{"duplicate key", `upstream: web, auth: { api_keys: { keys: { a: "` + testDigest + `", b: "` + testDigest + `" } } } }`, "auth.api_keys.keys.b: same key as a"},
+		{"hop-by-hop key header", `upstream: web, auth: { api_keys: { header: Connection, keys: { a: "` + testDigest + `" } } } }`, `auth.api_keys.header: "Connection" is a hop-by-hop header`},
+		{"identity is credentials", `upstream: web, auth: { api_keys: { keys: { a: "` + testDigest + `" } }, identity_header: x-api-key } }`, `auth.identity_header: "x-api-key" carries credentials`},
+		{"identity is authorization", `upstream: web, auth: { basic: { users: { alice: "` + testHash + `" } }, identity_header: Authorization } }`, "carries credentials"},
+		{"identity is host", `upstream: web, auth: { basic: { users: { alice: "` + testHash + `" } }, identity_header: Host } }`, "auth.identity_header: cannot be Host"},
+		{"canary without upstream", `upstream: web, canary: { percent: 5 } }`, "canary.upstream: is required"},
+		{"canary unknown upstream", `upstream: web, canary: { upstream: v3 } }`, `canary.upstream: unknown upstream "v3"`},
+		{"canary own upstream", `upstream: web, canary: { upstream: web } }`, "canary.upstream: is the route's own upstream"},
+		{"canary percent over 100", `upstream: web, canary: { upstream: v2, percent: 101 } }`, "canary.percent: must be between 0 and 100"},
+		{"canary percent NaN", `upstream: web, canary: { upstream: v2, percent: .nan } }`, "canary.percent: must be between 0 and 100"},
+		{"canary bad header", `upstream: web, canary: { upstream: v2, header: "X C" } }`, `canary.header: invalid header name "X C"`},
+		{"canary bad cookie", `upstream: web, canary: { upstream: v2, cookie: "a;b" } }`, `canary.cookie: invalid cookie name "a;b"`},
+		{"shadow own upstream", `upstream: web, shadow: { upstream: web } }`, "shadow.upstream: is the route's own upstream"},
+		{"shadow negative percent", `upstream: web, shadow: { upstream: v2, percent: -1 } }`, "shadow.percent: must be above 0"},
+		{"shadow negative concurrency", `upstream: web, shadow: { upstream: v2, max_concurrency: -1 } }`, "shadow.max_concurrency: must be at least 1"},
+		{"shadow negative timeout", `upstream: web, shadow: { upstream: v2, timeout: -1s } }`, "shadow.timeout: must be positive"},
+		{"websocket negative idle", `upstream: web, websocket: { idle_timeout: -1s } }`, "routes[0].websocket.idle_timeout: must be positive"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := strings.Replace(twoUpstreams, `upstream: web }`, tt.new, 1)
+			_, err := Parse([]byte(in), "")
+			if err == nil {
+				t.Fatalf("got no error, want one containing %q", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error:\n%v\nwant it to contain %q", err, tt.want)
+			}
+		})
+	}
+	if _, err := Parse([]byte("access: {}\n"+twoUpstreams), ""); err == nil || !strings.Contains(err.Error(), "access: set allow, deny or both") {
+		t.Errorf("empty top-level access: got %v", err)
+	}
+}
+
+func TestParseKeyDigest(t *testing.T) {
+	d, ok := ParseKeyDigest(testDigest)
+	if !ok || d != sha256.Sum256([]byte("key-one")) {
+		t.Errorf("ParseKeyDigest(%q) = %x, %v", testDigest, d, ok)
+	}
+	for _, s := range []string{"", "sha256:", "sha1:" + testDigest[7:], testDigest + "00", testDigest[:len(testDigest)-1] + "g"} {
+		if _, ok := ParseKeyDigest(s); ok {
+			t.Errorf("ParseKeyDigest(%q) succeeded", s)
+		}
+	}
+}
+
+func TestParseListenersPortZero(t *testing.T) {
+	in := strings.Replace(minimal, `[{ addr: ":8080" }]`, `[{ addr: "127.0.0.1:0" }, { addr: "127.0.0.1:0", h2c: true }]`, 1)
+	cfg, err := Parse([]byte(in), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Listeners) != 2 || !cfg.Listeners[1].H2C {
+		t.Errorf("listeners = %+v", cfg.Listeners)
+	}
 }

@@ -34,6 +34,13 @@ const (
 	defaultMaxCacheObject        = 1 << 20
 	defaultCacheMaxSize          = 64 << 20
 	defaultCacheLockTimeout      = 5 * time.Second
+	defaultRealm                 = "prism"
+	defaultAPIKeyHeader          = "X-API-Key"
+	defaultShadowPercent         = 100
+	defaultShadowMaxBody         = 64 << 10
+	defaultShadowConcurrency     = 16
+	defaultShadowTimeout         = 5 * time.Second
+	defaultWebSocketIdleTimeout  = 5 * time.Minute
 )
 
 // applyDefaults fills zero values only, so invalid input such as a negative
@@ -100,6 +107,23 @@ func (c *Config) applyDefaults() {
 		if ca := r.Cache; ca != nil {
 			setDefault(&ca.MaxObject, defaultMaxCacheObject)
 			setDefault(&ca.LockTimeout, defaultCacheLockTimeout)
+		}
+		if a := r.Auth; a != nil {
+			if b := a.Basic; b != nil {
+				setDefault(&b.Realm, defaultRealm)
+			}
+			if k := a.APIKeys; k != nil {
+				setDefault(&k.Header, defaultAPIKeyHeader)
+			}
+		}
+		if sh := r.Shadow; sh != nil {
+			setDefault(&sh.Percent, defaultShadowPercent)
+			setDefault(&sh.MaxBody, defaultShadowMaxBody)
+			setDefault(&sh.MaxConcurrency, defaultShadowConcurrency)
+			setDefault(&sh.Timeout, defaultShadowTimeout)
+		}
+		if ws := r.WebSocket; ws != nil {
+			setDefault(&ws.IdleTimeout, defaultWebSocketIdleTimeout)
 		}
 	}
 }

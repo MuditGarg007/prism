@@ -3,6 +3,7 @@ package admin
 import (
 	"encoding/json"
 	"net/http"
+	"net/netip"
 	"reflect"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/MuditGarg007/prism/internal/runtime"
 )
 
-// stateConfig has two upstreams, one with a breaker and outlier detection,
+// stateConfig has three upstreams, one with a breaker and outlier detection,
 // and three routes with different limits. Nothing is ever sent to the
 // backends.
 const stateConfig = `
@@ -27,11 +28,17 @@ upstreams:
   static:
     backends: [{ url: "http://127.0.0.1:3" }]
     health: { path: /healthz }
+  v2: { backends: [{ url: "http://127.0.0.1:4" }] }
 routes:
   - { match: { host: API.example.com, path_prefix: /v1/ }, upstream: web, max_concurrency: 4, queue_size: 2,
       rate_limit: { per_ip: 100/s }, retry: { attempts: 2, on: [connect_error, 503] } }
   - { match: { path_prefix: /assets/ }, upstream: static, max_body: 1500, cache: { enabled: true, stale_if_error: 1m } }
-  - { match: { path_prefix: / }, upstream: web, headers: { request_set: { X-B: "2", X-A: "1" } } }
+  - { match: { path_prefix: / }, upstream: web, headers: { request_set: { X-B: "2", X-A: "1" } },
+      access: { allow: [10.0.0.0/8], deny: [10.0.0.1] },
+      auth: { basic: { users: { alice: "$2a$10$7PTiybTg/fasyyDtp5gxKO.dwkbXmCniNwUPJz/LHRnxoqhi4pe/6" } }, api_keys: { keys: { ci: "sha256:abababababababababababababababababababababababababababababababab" } } },
+      canary: { upstream: v2, percent: 5, header: X-Canary },
+      shadow: { upstream: v2, max_concurrency: 3 },
+      websocket: { idle_timeout: 90s } }
 `
 
 func stateRuntime(t *testing.T) *runtime.Runtime {
@@ -66,6 +73,9 @@ func TestRoutes(t *testing.T) {
 	sem := rt.Routes[0].Concurrency
 	sem.TryAcquire()
 	defer sem.Release()
+	shadow := rt.Routes[2].Shadow.Slots
+	shadow.TryAcquire()
+	defer shadow.Release()
 
 	var got Routes
 	get(t, h, "/routes", &got)
@@ -75,12 +85,21 @@ func TestRoutes(t *testing.T) {
 			Concurrency: &Concurrency{InUse: 1, Limit: 4},
 		},
 		{Name: "/assets/", PathPrefix: "/assets/", Upstream: "static", Cache: true},
-		{Name: "/", PathPrefix: "/", Upstream: "web"},
+		{
+			Name: "/", PathPrefix: "/", Upstream: "web",
+			Access:    &config.Access{Allow: []config.Prefix{prefix("10.0.0.0/8")}, Deny: []config.Prefix{prefix("10.0.0.1/32")}},
+			Auth:      []string{"basic", "api_keys"},
+			Canary:    &CanaryInfo{Upstream: "v2", Percent: 5, Header: "X-Canary"},
+			Shadow:    &ShadowInfo{Upstream: "v2", Percent: 100, InFlight: 1, Limit: 3},
+			WebSocket: &WebSocketInfo{IdleTimeout: "1m30s"},
+		},
 	}
 	if !reflect.DeepEqual(got.Routes, want) {
 		t.Errorf("routes =\n%+v\nwant\n%+v", got.Routes, want)
 	}
 }
+
+func prefix(s string) config.Prefix { return config.Prefix{Prefix: netip.MustParsePrefix(s)} }
 
 func TestUpstreams(t *testing.T) {
 	rt := stateRuntime(t)
@@ -102,6 +121,9 @@ func TestUpstreams(t *testing.T) {
 		{Name: "static", Balancer: "round_robin", Available: 0, Backends: []BackendInfo{
 			{URL: "http://127.0.0.1:3", Weight: 1},
 		}},
+		{Name: "v2", Balancer: "round_robin", Available: 1, Backends: []BackendInfo{
+			{URL: "http://127.0.0.1:4", Weight: 1, Healthy: true, Available: true},
+		}},
 		{Name: "web", Balancer: "least_conn", Available: 1, Backends: []BackendInfo{
 			{URL: "http://user:xxxxx@127.0.0.1:1", Weight: 1, Healthy: true, Breaker: "open"},
 			{URL: "http://127.0.0.1:2", Weight: 3, Inflight: 1, Healthy: true, Breaker: "closed", Available: true},
@@ -122,7 +144,7 @@ func TestStateFollowsReload(t *testing.T) {
 	get(t, h, "/routes", &routes)
 	var ups Upstreams
 	get(t, h, "/upstreams", &ups)
-	if len(routes.Routes) != 3 || len(ups.Upstreams) != 2 {
-		t.Errorf("after the swap: %d routes, %d upstreams; want 3 and 2", len(routes.Routes), len(ups.Upstreams))
+	if len(routes.Routes) != 3 || len(ups.Upstreams) != 3 {
+		t.Errorf("after the swap: %d routes, %d upstreams; want 3 and 3", len(routes.Routes), len(ups.Upstreams))
 	}
 }

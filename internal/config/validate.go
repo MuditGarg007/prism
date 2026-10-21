@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"net"
@@ -10,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // ValidationError lists every problem found in a config. Each problem is
@@ -48,6 +52,9 @@ func (c *Config) validateLifecycle(p *problems) {
 		p.add("shutdown.drain_delay", "must not be negative, got %v", c.Shutdown.DrainDelay)
 	}
 	checkPositive(p, "shutdown.timeout", c.Shutdown.Timeout)
+	if a := c.Access; a != nil {
+		validateAccess(p, "access", a)
+	}
 	if a := c.Admin; a != nil {
 		if err := checkAddr(a.Listen); err != nil {
 			p.add("admin.listen", "%v", err)
@@ -86,7 +93,8 @@ func (c *Config) validateListeners(p *problems) {
 		if err := checkAddr(l.Addr); err != nil {
 			p.add(path+".addr", "%v", err)
 		}
-		if seen[l.Addr] {
+		// Port 0 picks a free port each time, so it never clashes.
+		if seen[l.Addr] && !strings.HasSuffix(l.Addr, ":0") {
 			p.add(path+".addr", "duplicate listener address %q", l.Addr)
 		}
 		seen[l.Addr] = true
@@ -95,6 +103,9 @@ func (c *Config) validateListeners(p *problems) {
 
 		if l.TLS == nil {
 			continue
+		}
+		if l.H2C {
+			p.add(path+".h2c", "is for listeners without TLS, which negotiate HTTP/2 already")
 		}
 		if len(l.TLS.Certs) == 0 {
 			p.add(path+".tls.certs", "at least one certificate is required")
@@ -265,6 +276,137 @@ func (c *Config) validateRoutes(p *problems) {
 		if ca := r.Cache; ca != nil {
 			validateCache(p, path+".cache", ca, c.Cache.MaxSize)
 		}
+		if a := r.Access; a != nil {
+			validateAccess(p, path+".access", a)
+		}
+		if a := r.Auth; a != nil {
+			validateAuth(p, path+".auth", a)
+		}
+		if ca := r.Canary; ca != nil {
+			c.validateCanary(p, path+".canary", ca, r.Upstream)
+		}
+		if sh := r.Shadow; sh != nil {
+			c.validateShadow(p, path+".shadow", sh, r.Upstream)
+		}
+		if ws := r.WebSocket; ws != nil {
+			checkPositive(p, path+".websocket.idle_timeout", ws.IdleTimeout)
+		}
+	}
+}
+
+func validateAccess(p *problems, path string, a *Access) {
+	if len(a.Allow) == 0 && len(a.Deny) == 0 {
+		p.add(path, "set allow, deny or both")
+	}
+}
+
+func validateAuth(p *problems, path string, a *Auth) {
+	if a.Basic == nil && a.APIKeys == nil {
+		p.add(path, "set basic, api_keys or both")
+	}
+	if b := a.Basic; b != nil {
+		// The realm goes inside a quoted string in WWW-Authenticate.
+		if strings.ContainsAny(b.Realm, "\"\\\r\n\x00") {
+			p.add(path+".basic.realm", "must not contain quotes, backslashes, CR, LF or NUL")
+		}
+		if len(b.Users) == 0 {
+			p.add(path+".basic.users", "at least one user is required")
+		}
+		for _, name := range slices.Sorted(maps.Keys(b.Users)) {
+			upath := path + ".basic.users." + name
+			// The client sends "user:password", split at the first colon.
+			if name == "" || strings.ContainsFunc(name, func(r rune) bool { return r == ':' || r < 0x20 || r == 0x7f }) {
+				p.add(upath, "user name must be non-empty, without colons or control characters")
+			}
+			if _, err := bcrypt.Cost([]byte(b.Users[name])); err != nil {
+				p.add(upath, "not a bcrypt hash: %v", err)
+			}
+		}
+	}
+	if k := a.APIKeys; k != nil {
+		checkHeaderName(p, path+".api_keys.header", k.Header)
+		if len(k.Keys) == 0 {
+			p.add(path+".api_keys.keys", "at least one key is required")
+		}
+		seen := map[string]string{}
+		for _, name := range slices.Sorted(maps.Keys(k.Keys)) {
+			kpath := path + ".api_keys.keys." + name
+			digest, ok := ParseKeyDigest(k.Keys[name])
+			if !ok {
+				p.add(kpath, "must be \"sha256:\" followed by 64 hex digits")
+				continue
+			}
+			if other, dup := seen[string(digest[:])]; dup {
+				p.add(kpath, "same key as %s", other)
+			}
+			seen[string(digest[:])] = name
+		}
+	}
+	if h := a.IdentityHeader; h != "" {
+		checkHeaderName(p, path+".identity_header", h)
+		if strings.EqualFold(h, "Authorization") || (a.APIKeys != nil && strings.EqualFold(h, a.APIKeys.Header)) {
+			p.add(path+".identity_header", "%q carries credentials", h)
+		}
+	}
+}
+
+// ParseKeyDigest parses an API key digest written as "sha256:<hex>".
+func ParseKeyDigest(s string) (d [sha256.Size]byte, ok bool) {
+	h, found := strings.CutPrefix(s, "sha256:")
+	if !found || len(h) != 2*sha256.Size {
+		return d, false
+	}
+	_, err := hex.Decode(d[:], []byte(h))
+	return d, err == nil
+}
+
+func (c *Config) validateCanary(p *problems, path string, ca *Canary, primary string) {
+	c.checkSideUpstream(p, path+".upstream", ca.Upstream, primary)
+	// Written this way round so NaN fails too.
+	if !(ca.Percent >= 0 && ca.Percent <= 100) {
+		p.add(path+".percent", "must be between 0 and 100, got %v", ca.Percent)
+	}
+	if ca.Header != "" {
+		checkHeaderName(p, path+".header", ca.Header)
+	}
+	if ca.Cookie != "" && !isToken(ca.Cookie) {
+		p.add(path+".cookie", "invalid cookie name %q", ca.Cookie)
+	}
+}
+
+func (c *Config) validateShadow(p *problems, path string, sh *Shadow, primary string) {
+	c.checkSideUpstream(p, path+".upstream", sh.Upstream, primary)
+	if !(sh.Percent > 0 && sh.Percent <= 100) {
+		p.add(path+".percent", "must be above 0 and at most 100, got %v", sh.Percent)
+	}
+	checkMin(p, path+".max_concurrency", sh.MaxConcurrency, 1)
+	checkPositive(p, path+".timeout", sh.Timeout)
+}
+
+// checkSideUpstream checks the upstream of a canary or shadow, which must
+// exist and differ from the route's own.
+func (c *Config) checkSideUpstream(p *problems, path, name, primary string) {
+	switch _, ok := c.Upstreams[name]; {
+	case name == "":
+		p.add(path, "is required")
+	case !ok:
+		p.add(path, "unknown upstream %q", name)
+	case name == primary:
+		p.add(path, "is the route's own upstream")
+	}
+}
+
+// checkHeaderName checks a header that Prism reads or sets for a feature:
+// it must be a valid name, and neither a hop-by-hop header, which never
+// reaches the proxy's logic, nor Host.
+func checkHeaderName(p *problems, path, name string) {
+	switch {
+	case !isToken(name):
+		p.add(path, "invalid header name %q", name)
+	case slices.Contains(hopByHop, strings.ToLower(name)):
+		p.add(path, "%q is a hop-by-hop header, meant for the connection only", name)
+	case strings.EqualFold(name, "Host"):
+		p.add(path, "cannot be Host")
 	}
 }
 

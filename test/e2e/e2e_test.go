@@ -103,10 +103,14 @@ type instance struct {
 }
 
 // writeConfig writes body, a config with everything but the listeners, to
-// path, with a listener on a free loopback port.
+// path, with a listener on a free loopback port. A body that starts with
+// its own listeners is written as it is.
 func writeConfig(t *testing.T, path, body string) {
 	t.Helper()
-	yaml := "listeners: [{ addr: \"127.0.0.1:0\" }]\n" + body
+	yaml := body
+	if !strings.HasPrefix(body, "listeners:") {
+		yaml = "listeners: [{ addr: \"127.0.0.1:0\" }]\n" + body
+	}
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}

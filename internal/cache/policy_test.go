@@ -63,7 +63,7 @@ func TestStorable(t *testing.T) {
 				req = http.Header{}
 			}
 			cc := ParseCacheControl(tt.h["Cache-Control"])
-			if got := Storable(req, tt.code, tt.h, cc); got != tt.want {
+			if got := Storable(req.Get("Authorization") != "", tt.code, tt.h, cc); got != tt.want {
 				t.Errorf("Storable = %q, want %q", got, tt.want)
 			}
 		})

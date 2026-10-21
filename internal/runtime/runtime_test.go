@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -73,7 +74,7 @@ func TestBuildExample(t *testing.T) {
 	}
 	defer rt.Close()
 
-	if len(rt.Pools) != 2 || len(rt.Pools["api"].Backends) != 2 {
+	if len(rt.Pools) != 3 || len(rt.Pools["api"].Backends) != 2 {
 		t.Errorf("pools = %v", rt.Pools)
 	}
 	// The example's admin API is on loopback, and everything it sets is
@@ -83,6 +84,27 @@ func TestBuildExample(t *testing.T) {
 	}
 	if rt.Cache == nil || rt.Cache.MaxSize != 64<<20 {
 		t.Errorf("cache = %+v, want a 64 MB store", rt.Cache)
+	}
+}
+
+func TestBuildBasicAuthWarning(t *testing.T) {
+	for _, rl := range []string{"", ", rate_limit: { per_ip: 10/s }"} {
+		cfg := parse(t, fmt.Sprintf(`
+listeners: [{ addr: ":8080" }]
+upstreams:
+  web: { backends: [{ url: "http://127.0.0.1:1" }] }
+routes:
+  - { match: { path_prefix: / }, upstream: web, auth: { basic: { users: { alice: %q } } }%s }
+`, testHash, rl), "")
+		var logs bytes.Buffer
+		rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt.Close()
+		if warned := strings.Contains(logs.String(), "no rate_limit"); warned != (rl == "") {
+			t.Errorf("rate limit %q: warned %v; logs %q", rl, warned, logs.String())
+		}
 	}
 }
 
@@ -386,4 +408,69 @@ routes:
 		}
 	}
 	rt.Close()
+}
+
+// TestBuildSecurityAndSplits checks that Build wires access lists, auth,
+// the canary and the shadow into the handler.
+func TestBuildSecurityAndSplits(t *testing.T) {
+	backend := func(name string) string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, name+" "+r.Header.Get("X-Auth-User"))
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+	cfg := parse(t, fmt.Sprintf(`
+listeners: [{ addr: ":8080" }]
+access: { deny: [192.0.2.0/24] }
+upstreams:
+  web: { backends: [{ url: %q }] }
+  v2: { backends: [{ url: %q }] }
+routes:
+  - match: { path_prefix: / }
+    upstream: web
+    access: { allow: [10.0.0.0/8] }
+    auth: { basic: { users: { alice: %q } }, identity_header: X-Auth-User }
+    canary: { upstream: v2, percent: 2.5, header: x-canary }
+    shadow: { upstream: v2, percent: 50, max_concurrency: 3 }
+    websocket: { idle_timeout: 90s }
+`, backend("web"), backend("v2"), testHash), "")
+	rt := build(t, cfg)
+	r := rt.Routes[0]
+	if c := r.Canary; c == nil || c.Pool != rt.Pools["v2"] || c.Buckets != 250 || c.Header != "X-Canary" {
+		t.Fatalf("canary = %+v", r.Canary)
+	}
+	if s := r.Shadow; s == nil || s.Pool != rt.Pools["v2"] || s.Buckets != 5000 || s.Slots.Cap() != 3 || s.MaxBody != 64<<10 {
+		t.Fatalf("shadow = %+v", r.Shadow)
+	}
+	if r.WebSocketIdle != 90*time.Second {
+		t.Errorf("WebSocketIdle = %v, want 90s", r.WebSocketIdle)
+	}
+
+	send := func(addr string, hdr ...string) (int, string) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = addr + ":1234"
+		for i := 0; i < len(hdr); i += 2 {
+			req.Header.Set(hdr[i], hdr[i+1])
+		}
+		w := httptest.NewRecorder()
+		rt.Handler.ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
+	if code, _ := send("192.0.2.1"); code != http.StatusForbidden {
+		t.Errorf("globally denied client got %d, want 403", code)
+	}
+	if code, _ := send("198.51.100.1"); code != http.StatusForbidden {
+		t.Errorf("client outside the route's allow list got %d, want 403", code)
+	}
+	if code, _ := send("10.0.0.1"); code != http.StatusUnauthorized {
+		t.Errorf("client without credentials got %d, want 401", code)
+	}
+	creds := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret"))
+	if code, body := send("10.0.0.1", "Authorization", creds, "X-Canary", "always"); code != 200 || body != "v2 alice" {
+		t.Errorf("canary request got %d %q, want 200 \"v2 alice\"", code, body)
+	}
+	if code, body := send("10.0.0.1", "Authorization", creds, "X-Canary", "never"); code != 200 || body != "web alice" {
+		t.Errorf("primary request got %d %q, want 200 \"web alice\"", code, body)
+	}
 }

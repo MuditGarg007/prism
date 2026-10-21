@@ -20,6 +20,16 @@ type Config struct {
 	Cache CacheStore `yaml:"cache"`
 	// Admin, when set, serves the admin API on its own listener.
 	Admin *Admin `yaml:"admin"`
+	// Access filters every request by client IP before routing.
+	Access *Access `yaml:"access"`
+}
+
+// Access allows or refuses requests by client IP, the address left after
+// trusted_proxies. A client in Deny is refused. Otherwise, when Allow is not
+// empty, only a client in it is let through.
+type Access struct {
+	Allow []Prefix `yaml:"allow"`
+	Deny  []Prefix `yaml:"deny"`
 }
 
 type CacheStore struct {
@@ -43,6 +53,10 @@ type Listener struct {
 	Addr     string           `yaml:"addr"`
 	TLS      *ListenerTLS     `yaml:"tls"`
 	Timeouts ListenerTimeouts `yaml:"timeouts"`
+	// H2C also serves HTTP/2 without TLS, to clients that start with it
+	// ("prior knowledge"), next to HTTP/1. TLS listeners negotiate HTTP/2
+	// anyway.
+	H2C bool `yaml:"h2c"`
 }
 
 // ListenerTimeouts has no read or write timeout for the whole request,
@@ -81,7 +95,8 @@ type Upstream struct {
 }
 
 // A redact tag hides a field from the admin API's GET /config: "url" masks
-// a URL's password, and "secret" hides the whole value.
+// a URL's password, "secret" hides the whole value, and "values" hides a
+// map's values but shows its keys.
 type Backend struct {
 	URL    string      `yaml:"url" redact:"url"`
 	Weight int         `yaml:"weight"`
@@ -145,6 +160,69 @@ type Route struct {
 	QueueTimeout time.Duration `yaml:"queue_timeout"`
 	Retry        *Retry        `yaml:"retry"`
 	Cache        *Cache        `yaml:"cache"`
+	Access       *Access       `yaml:"access"`
+	Auth         *Auth         `yaml:"auth"`
+	Canary       *Canary       `yaml:"canary"`
+	Shadow       *Shadow       `yaml:"shadow"`
+	WebSocket    *WebSocket    `yaml:"websocket"`
+}
+
+// WebSocket lets a route's requests upgrade to WebSockets. Once upgraded, a
+// connection is closed after IdleTimeout without data in either direction.
+type WebSocket struct {
+	IdleTimeout time.Duration `yaml:"idle_timeout"`
+}
+
+// Auth requires a request to carry valid credentials: a user and password
+// for Basic, or a key for APIKeys. With both set, either one is accepted.
+type Auth struct {
+	Basic   *BasicAuth `yaml:"basic"`
+	APIKeys *APIKeys   `yaml:"api_keys"`
+	// ForwardCredentials keeps the checked Authorization or API key header
+	// on the request sent to the backend. By default Prism removes it.
+	ForwardCredentials bool `yaml:"forward_credentials"`
+	// IdentityHeader, when set, names a header that tells the backend who
+	// was let in: the user name, or the name of the key. Any copy of it the
+	// client sent is removed.
+	IdentityHeader string `yaml:"identity_header"`
+}
+
+// BasicAuth maps user names to bcrypt hashes, such as those from
+// "htpasswd -nbB user password".
+type BasicAuth struct {
+	Realm string            `yaml:"realm"`
+	Users map[string]string `yaml:"users" redact:"values"`
+}
+
+// APIKeys maps key names to "sha256:<hex>" digests of the keys. The key is
+// read from Header, or from "Authorization: Bearer <key>" when Header is
+// Authorization.
+type APIKeys struct {
+	Header string            `yaml:"header"`
+	Keys   map[string]string `yaml:"keys" redact:"values"`
+}
+
+// Canary sends Percent of clients to Upstream instead of the route's
+// upstream. A client stays on the same side while Percent is unchanged, and
+// raising Percent only moves clients to the canary. A Header or Cookie
+// value of "always" or "never" overrides the split for one request.
+type Canary struct {
+	Upstream string  `yaml:"upstream"`
+	Percent  float64 `yaml:"percent"`
+	Header   string  `yaml:"header"`
+	Cookie   string  `yaml:"cookie"`
+}
+
+// Shadow sends a copy of Percent of the requests that go to a backend to
+// Upstream as well, and throws its response away. Copies never delay the
+// real request: a body over MaxBody, or of unknown length, is not copied,
+// and a copy that finds MaxConcurrency copies already running is dropped.
+type Shadow struct {
+	Upstream       string        `yaml:"upstream"`
+	Percent        float64       `yaml:"percent"`
+	MaxBody        ByteSize      `yaml:"max_body"`
+	MaxConcurrency int           `yaml:"max_concurrency"`
+	Timeout        time.Duration `yaml:"timeout"` // for the whole copy, body included
 }
 
 type Match struct {

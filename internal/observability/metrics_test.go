@@ -221,3 +221,31 @@ func BenchmarkObserve(b *testing.B) {
 		}
 	})
 }
+
+func TestShadowMetrics(t *testing.T) {
+	m := NewMetrics()
+	m.Shadow("a/").Inc(ShadowBusy)
+	m.Shadow("b/").Inc(ShadowSent)
+	var nilSM *ShadowMetrics
+	nilSM.Inc(ShadowSent) // records nothing, and must not panic
+	got := gather(t, m)
+	for series, want := range map[string]float64{
+		`prism_shadow_requests_total{result="busy",route="a/"}`:         1,
+		`prism_shadow_requests_total{result="sent",route="a/"}`:         0,
+		`prism_shadow_requests_total{result="body_skipped",route="a/"}`: 0,
+		`prism_shadow_requests_total{result="sent",route="b/"}`:         1,
+	} {
+		if v, ok := got[series]; !ok || v != want {
+			t.Errorf("%s = %v (present %v), want %v", series, v, ok, want)
+		}
+	}
+	// a/ stops shadowing; b/ goes on.
+	m.Prune(Series{Shadows: map[string]bool{"a/": true, "b/": true}}, Series{Shadows: map[string]bool{"b/": true}})
+	got = gather(t, m)
+	if _, ok := got[`prism_shadow_requests_total{result="busy",route="a/"}`]; ok {
+		t.Error("a/'s shadow series survived")
+	}
+	if _, ok := got[`prism_shadow_requests_total{result="sent",route="b/"}`]; !ok {
+		t.Error("b/'s shadow series was deleted")
+	}
+}

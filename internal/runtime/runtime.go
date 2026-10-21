@@ -4,12 +4,15 @@
 package runtime
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
+	"reflect"
 	"slices"
 	"sync/atomic"
 
@@ -23,6 +26,7 @@ import (
 	"github.com/MuditGarg007/prism/internal/ratelimit"
 	"github.com/MuditGarg007/prism/internal/resilience"
 	"github.com/MuditGarg007/prism/internal/router"
+	"github.com/MuditGarg007/prism/internal/security"
 	"github.com/MuditGarg007/prism/internal/upstream"
 )
 
@@ -140,6 +144,10 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 	for i, r := range cfg.Routes {
 		name := r.Match.Host + r.Match.PathPrefix
 		old, hasOld := prevRoutes[name]
+		if r.Auth != nil && r.Auth.Basic != nil && r.RateLimit == nil {
+			// Only the route's rate limit slows password guessing.
+			log.Warn("route checks passwords but has no rate_limit, so guessing is limited only by bcrypt", "route", name)
+		}
 		pool, ok := rt.Pools[r.Upstream]
 		if !ok {
 			return nil, fmt.Errorf("routes[%d]: unknown upstream %q", i, r.Upstream)
@@ -208,6 +216,51 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 			Cache:        pc,
 			Metrics:      rm,
 		}
+		if a := r.Access; a != nil {
+			route.Access = ipFilter(a)
+		}
+		if ws := r.WebSocket; ws != nil {
+			route.WebSocketIdle = ws.IdleTimeout
+		}
+		if ca := r.Canary; ca != nil {
+			route.Canary = &proxy.Canary{
+				Pool:    rt.Pools[ca.Upstream],
+				Buckets: uint32(math.Round(ca.Percent * 100)),
+				Cookie:  ca.Cookie,
+			}
+			if ca.Header != "" {
+				route.Canary.Header = http.CanonicalHeaderKey(ca.Header)
+			}
+			if m != nil {
+				route.Canary.Metrics = m.Route(name, ca.Upstream)
+			}
+		}
+		if sh := r.Shadow; sh != nil {
+			route.Shadow = &proxy.Shadow{
+				Pool:    rt.Pools[sh.Upstream],
+				Buckets: uint32(math.Round(sh.Percent * 100)),
+				MaxBody: int64(sh.MaxBody),
+				Timeout: sh.Timeout,
+			}
+			// Copies still running on the old runtime keep counting
+			// against the cap.
+			if hasOld && old.route.Shadow != nil && old.cfg.Shadow.MaxConcurrency == sh.MaxConcurrency {
+				route.Shadow.Slots = old.route.Shadow.Slots
+			} else {
+				route.Shadow.Slots = limits.NewSemaphore(sh.MaxConcurrency, 0)
+			}
+			if m != nil {
+				route.Shadow.Metrics = m.Shadow(name)
+			}
+		}
+		if a := r.Auth; a != nil {
+			// Kept while unchanged, with the passwords it has verified.
+			if hasOld && old.route.Auth != nil && reflect.DeepEqual(old.cfg.Auth, a) {
+				route.Auth = old.route.Auth
+			} else {
+				route.Auth = authenticator(a)
+			}
+		}
 		rt.Routes = append(rt.Routes, route)
 		entries = append(entries, router.Entry[*proxy.Route]{
 			Host:       r.Match.Host,
@@ -220,15 +273,16 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 		return nil, err
 	}
 
-	trusted := make([]netip.Prefix, len(cfg.TrustedProxies))
-	for i, p := range cfg.TrustedProxies {
-		trusted[i] = p.Prefix
-	}
+	trusted := prefixes(cfg.TrustedProxies)
 	var unmatched *observability.RouteMetrics
 	if m != nil {
 		unmatched = m.Unmatched()
 	}
-	rt.Handler = proxy.NewHandler(table, proxy.NewForwarding(trusted, cfg.ForwardedHeader), unmatched, log)
+	var access *security.IPFilter
+	if a := cfg.Access; a != nil {
+		access = ipFilter(a)
+	}
+	rt.Handler = proxy.NewHandler(table, proxy.NewForwarding(trusted, cfg.ForwardedHeader), access, unmatched, log)
 	// Last, so a reload that fails never shrinks the cache or changes the
 	// backend health that prev serves with.
 	if c := rt.Cache; prev != nil && prev.Cache != nil && c != nil && c.MaxSize != prev.Cache.MaxSize {
@@ -238,6 +292,34 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 		p.Commit()
 	}
 	return rt, nil
+}
+
+func authenticator(a *config.Auth) *security.Authenticator {
+	c := security.AuthConfig{Forward: a.ForwardCredentials, IdentityHeader: a.IdentityHeader}
+	if b := a.Basic; b != nil {
+		c.Realm, c.Users = b.Realm, b.Users
+	}
+	if k := a.APIKeys; k != nil {
+		c.KeyHeader = k.Header
+		c.Keys = make(map[[sha256.Size]byte]string, len(k.Keys))
+		for name, s := range k.Keys {
+			d, _ := config.ParseKeyDigest(s) // validated
+			c.Keys[d] = name
+		}
+	}
+	return security.NewAuthenticator(c)
+}
+
+func ipFilter(a *config.Access) *security.IPFilter {
+	return security.NewIPFilter(prefixes(a.Allow), prefixes(a.Deny))
+}
+
+func prefixes(ps []config.Prefix) []netip.Prefix {
+	out := make([]netip.Prefix, len(ps))
+	for i, p := range ps {
+		out[i] = p.Prefix
+	}
+	return out
 }
 
 func sameBudget(a, b *config.Retry) bool {

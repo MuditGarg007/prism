@@ -32,8 +32,10 @@ upstreams:
     backends: [%s]
     circuit_breaker: { failure_ratio: 0.5, min_requests: 20, open_for: 30s }
     outlier: { consecutive_failures: 5, base_ejection: 30s, max_ejection: 300s, max_ejection_percent: 50 }
+  dark: { backends: [{ url: "http://127.0.0.1:1" }] }
 routes:
-  - { match: { path_prefix: /api/ }, upstream: web, max_concurrency: 8, queue_size: 4, queue_timeout: 1s }
+  - { match: { path_prefix: /api/ }, upstream: web, max_concurrency: 8, queue_size: 4, queue_timeout: 1s,
+      shadow: { upstream: dark, max_concurrency: 3 } }
   - { match: { path_prefix: / }, upstream: web, cache: { enabled: true } }
 `, strings.Join(list, ", ")), "")
 	if err != nil {
@@ -67,6 +69,9 @@ func TestMetrics(t *testing.T) {
 	h := New(runtime.NewCurrent(rt), m, nil, discard)
 
 	rt.Pools["web"].Backends[1].SetHealthy(false)
+	shadowSlots := rt.Routes[0].Shadow.Slots
+	shadowSlots.TryAcquire()
+	defer shadowSlots.Release()
 	for range 2 {
 		rec := httptest.NewRecorder()
 		rt.Handler.ServeHTTP(rec, httptest.NewRequest("GET", "/page", nil))
@@ -83,6 +88,7 @@ func TestMetrics(t *testing.T) {
 		`prism_route_concurrency_in_use{route="/api/"} 0`,
 		`prism_route_concurrency_limit{route="/api/"} 8`,
 		`prism_route_queue_depth{route="/api/"} 0`,
+		`prism_shadow_inflight{route="/api/"} 1`,
 		`prism_cache_requests_total{result="MISS"} 1`,
 		`prism_cache_requests_total{result="HIT"} 1`,
 		`prism_cache_entries 1`,

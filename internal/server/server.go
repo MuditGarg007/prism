@@ -36,7 +36,7 @@ type Server struct {
 // it before routing: 200 until Drain, 503 after.
 func New(listeners []config.Listener, readyPath string, h http.Handler, log *slog.Logger) (*Server, error) {
 	s := &Server{log: log, errc: make(chan error, len(listeners))}
-	handler := accessLog(h, log)
+	handler := accessLog(h, log, s.TrackHijacked)
 	if readyPath != "" {
 		handler = s.readiness(readyPath, handler)
 	}
@@ -48,6 +48,12 @@ func New(listeners []config.Listener, readyPath string, h http.Handler, log *slo
 			IdleTimeout:       l.Timeouts.Idle,
 			// Mostly TLS handshake failures from clients and scanners.
 			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		}
+		if l.H2C {
+			p := new(http.Protocols)
+			p.SetHTTP1(true)
+			p.SetUnencryptedHTTP2(true)
+			srv.Protocols = p
 		}
 		var certs *atomic.Pointer[certStore]
 		if l.TLS != nil {

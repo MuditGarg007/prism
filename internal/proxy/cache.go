@@ -245,7 +245,7 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 			ne := cache.Revalidated(e, resp.Header, requested, received)
 			if o.store {
 				res := cache.Uncacheable
-				why := cache.Storable(r.Header, ne.Status, ne.Header, ne.CC)
+				why := cache.Storable(authenticated(r, an), ne.Status, ne.Header, ne.CC)
 				switch {
 				case why == "" && c.Store.Put(ne):
 					res = cache.Stored
@@ -272,7 +272,7 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 	)
 	if o.store {
 		cc = cache.ParseCacheControl(resp.Header["Cache-Control"])
-		if why := unstorable(r, resp, cc, c.MaxObject); why == "" {
+		if why := unstorable(authenticated(r, an), resp, cc, c.MaxObject); why == "" {
 			// Taken before the route's response rules, which are applied
 			// each time the entry is served.
 			stored = resp.Header.Clone()
@@ -327,10 +327,17 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 	}
 }
 
-// unstorable returns why resp, the response to r, must not be stored, or ""
-// if it may be.
-func unstorable(r *http.Request, resp *http.Response, cc cache.Directives, maxObject int64) string {
-	if why := cache.Storable(r.Header, resp.StatusCode, resp.Header, cc); why != "" {
+// authenticated reports whether r carried credentials, either an
+// Authorization header or ones the route's auth checked. A response to such
+// a request may be for that client only.
+func authenticated(r *http.Request, an *Annotations) bool {
+	return an.User != "" || r.Header.Get("Authorization") != ""
+}
+
+// unstorable returns why resp must not be stored, or "" if it may be.
+// authenticated says whether its request carried credentials.
+func unstorable(authenticated bool, resp *http.Response, cc cache.Directives, maxObject int64) string {
+	if why := cache.Storable(authenticated, resp.StatusCode, resp.Header, cc); why != "" {
 		return why
 	}
 	switch {
