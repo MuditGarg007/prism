@@ -1,7 +1,7 @@
 // Package admin serves the admin API: the routes, the live state of the
-// upstreams, the effective config, Prometheus metrics, config reloads, and
-// cache statistics and purging. It has no authentication, so it belongs on a loopback
-// listener.
+// upstreams, the effective config, Prometheus metrics, config reloads, cache
+// statistics and purging, and optionally Go's profiler. It has no
+// authentication, so it belongs on a loopback listener.
 package admin
 
 import (
@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -33,7 +34,9 @@ type Handler struct {
 // New returns the admin API for cur. When m is set, GET /metrics serves its
 // registry, to which New adds the state of whichever Runtime is current. It
 // must be called at most once per m. When reload is set, POST /reload calls
-// it, as SIGHUP does.
+// it, as SIGHUP does. When the current config sets admin.pprof, Go's
+// profiler is served under /debug/pprof/; admin settings need a restart, so
+// the config at New is the one that counts.
 func New(cur *runtime.Current, m *observability.Metrics, reload func() error, log *slog.Logger) *Handler {
 	h := &Handler{cur: cur, reload: reload, log: log, mux: http.NewServeMux()}
 	h.mux.HandleFunc("GET /routes", h.routes)
@@ -43,6 +46,14 @@ func New(cur *runtime.Current, m *observability.Metrics, reload func() error, lo
 	h.mux.HandleFunc("POST /cache/purge", h.cachePurge)
 	if reload != nil {
 		h.mux.HandleFunc("POST /reload", h.reloadConfig)
+	}
+	if rt := cur.Load(); rt != nil && rt.Config != nil && rt.Config.Admin != nil && rt.Config.Admin.Pprof {
+		h.mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		h.mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		h.mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		h.mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		h.mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+		h.mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 	}
 	if m != nil {
 		m.Registry.MustRegister(collector{cur})

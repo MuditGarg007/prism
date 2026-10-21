@@ -25,6 +25,9 @@ type Trace struct {
 	Parent [8]byte // the client's span; zero when Prism started the trace
 	SpanID [8]byte
 	Flags  byte
+	// header is the traceparent, formatted once by newTrace. Its hex IDs
+	// also serve the access log, so they are encoded only once.
+	header string
 }
 
 // Joined reports whether the trace came from the client rather than being
@@ -45,6 +48,7 @@ func newTrace(hdr http.Header) Trace {
 		if id, parent, flags, ok := parseTraceparent(vv[0]); ok {
 			t.ID, t.Parent, t.Flags = id, parent, flags
 			rand.Read(t.SpanID[:])
+			t.header = t.format()
 			return t
 		}
 	}
@@ -53,12 +57,28 @@ func newTrace(hdr http.Header) Trace {
 	copy(t.ID[:], b[:16])
 	copy(t.SpanID[:], b[16:])
 	t.Flags = traceSampled
+	t.header = t.format()
 	return t
 }
 
-// traceparent formats the header for a request Prism sends as part of t.
-// Prism speaks version 00, whatever version the client sent.
+// traceparent returns the header for a request Prism sends as part of t.
 func (t *Trace) traceparent() string {
+	if t.header != "" {
+		return t.header
+	}
+	return t.format()
+}
+
+// HexIDs returns the trace ID and span ID as lowercase hex, as they appear
+// in traceparent.
+func (t *Trace) HexIDs() (traceID, spanID string) {
+	tp := t.traceparent()
+	return tp[3:35], tp[36:52]
+}
+
+// format formats t as a traceparent. Prism speaks version 00, whatever
+// version the client sent.
+func (t *Trace) format() string {
 	var buf [55]byte
 	b := append(buf[:0], "00-"...)
 	b = hex.AppendEncode(b, t.ID[:])
@@ -70,9 +90,11 @@ func (t *Trace) traceparent() string {
 }
 
 // propagate sets the trace headers on hdr, a request going to a backend.
-// The client's tracestate goes on only with the trace it belongs to.
-func (t *Trace) propagate(hdr http.Header) {
-	hdr[traceparentHeader] = []string{t.traceparent()}
+// tp holds the traceparent value, so the caller can share its array with
+// other headers. The client's tracestate goes on only with the trace it
+// belongs to.
+func (t *Trace) propagate(hdr http.Header, tp []string) {
+	hdr[traceparentHeader] = tp
 	if !t.Joined() {
 		delete(hdr, tracestateHeader)
 	}

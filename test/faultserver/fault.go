@@ -19,6 +19,9 @@ type Faults struct {
 	ErrorStatus int           `json:"error_status"` // 503 by default
 	DropRate    float64       `json:"drop_rate"`    // share of requests cut off mid-body
 	BodySize    int           `json:"body_size"`    // bytes in a normal response
+	// CacheControl, when set, is sent on normal responses, so a caching
+	// proxy can store them.
+	CacheControl string `json:"cache_control"`
 }
 
 // faultServer serves every path with the current faults, except two control
@@ -75,6 +78,9 @@ func (s *faultServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body[i] = 'x'
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	if f.CacheControl != "" {
+		w.Header().Set("Cache-Control", f.CacheControl)
+	}
 	if f.DropRate > 0 && s.randF() < f.DropRate {
 		// Promise the whole body, send half, and abort: the client sees
 		// a 200 whose body ends early.
@@ -106,6 +112,8 @@ func (s *faultServer) control(w http.ResponseWriter, r *http.Request) {
 			f.DropRate, err = strconv.ParseFloat(v, 64)
 		case "body_size":
 			f.BodySize, err = strconv.Atoi(v)
+		case "cache_control":
+			f.CacheControl = v
 		default:
 			err = fmt.Errorf("unknown fault")
 		}

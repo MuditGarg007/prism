@@ -143,7 +143,7 @@ func lifetime(h http.Header, cc Directives, date time.Time) time.Duration {
 	// RFC 9111 §5.3: an invalid Expires, such as "0", is in the past.
 	var exp time.Time
 	if len(vv) > 0 {
-		exp, _ = http.ParseTime(vv[0])
+		exp, _ = parseTime(vv[0])
 	}
 	if exp.IsZero() || !exp.After(date) {
 		return 0
@@ -154,10 +154,21 @@ func lifetime(h http.Header, cc Directives, date time.Time) time.Duration {
 // responseDate returns the Date of a response, or received when it has
 // none or an invalid one.
 func responseDate(h http.Header, received time.Time) time.Time {
-	if t, err := http.ParseTime(h.Get("Date")); err == nil {
+	if t, ok := parseTime(h.Get("Date")); ok {
 		return t
 	}
 	return received
+}
+
+// parseTime is http.ParseTime, except that an empty value, the usual case
+// for a missing header, fails without the three parse errors ParseTime
+// allocates on the way.
+func parseTime(v string) (time.Time, bool) {
+	if v == "" {
+		return time.Time{}, false
+	}
+	t, err := http.ParseTime(v)
+	return t, err == nil
 }
 
 // initialAge implements corrected_initial_age from RFC 9111 §4.2.3: the

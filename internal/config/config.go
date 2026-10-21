@@ -38,6 +38,9 @@ type CacheStore struct {
 
 type Admin struct {
 	Listen string `yaml:"listen"`
+	// Pprof serves Go's profiler under /debug/pprof/ on the admin listener.
+	// A CPU profile or trace slows the process while it runs.
+	Pprof bool `yaml:"pprof"`
 }
 
 type Shutdown struct {

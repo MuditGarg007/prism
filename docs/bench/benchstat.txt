@@ -1,0 +1,72 @@
+goos: linux
+goarch: amd64
+pkg: github.com/MuditGarg007/prism/internal/cache
+cpu: 13th Gen Intel(R) Core(TM) i7-13620H
+                     │   old.txt   │      new.txt       │
+                     │   sec/op    │   sec/op     vs base   │
+NotModified-16         75.72n ± 4%
+NotModified/etag-16                  77.73n ± 7%
+NotModified/plain-16                 20.17n ± 9%
+geomean                75.72n        39.59n       ? ¹ ²
+¹ benchmark set differs from baseline; geomeans may not be comparable
+² ratios must be >0 to compute geomean
+
+                     │   old.txt    │       new.txt       │
+                     │     B/op     │    B/op     vs base │
+NotModified-16         0.000 ± 0%
+NotModified/etag-16                   0.000 ± 0%
+NotModified/plain-16                  0.000 ± 0%
+geomean                           ¹               ? ² ¹ ³
+¹ summaries must be >0 to compute geomean
+² benchmark set differs from baseline; geomeans may not be comparable
+³ ratios must be >0 to compute geomean
+
+                     │   old.txt    │       new.txt       │
+                     │  allocs/op   │ allocs/op   vs base │
+NotModified-16         0.000 ± 0%
+NotModified/etag-16                   0.000 ± 0%
+NotModified/plain-16                  0.000 ± 0%
+geomean                           ¹               ? ² ¹ ³
+¹ summaries must be >0 to compute geomean
+² benchmark set differs from baseline; geomeans may not be comparable
+³ ratios must be >0 to compute geomean
+
+pkg: github.com/MuditGarg007/prism/internal/proxy
+            │   old.txt   │               new.txt               │
+            │   sec/op    │   sec/op     vs base                │
+CacheHit-16   922.0n ± 2%   821.9n ± 1%  -10.87% (p=0.000 n=10)
+
+            │  old.txt   │              new.txt               │
+            │    B/op    │    B/op     vs base                │
+CacheHit-16   784.0 ± 0%   608.0 ± 0%  -22.45% (p=0.000 n=10)
+
+            │   old.txt   │              new.txt               │
+            │  allocs/op  │ allocs/op   vs base                │
+CacheHit-16   11.000 ± 0%   9.000 ± 0%  -18.18% (p=0.000 n=10)
+
+pkg: github.com/MuditGarg007/prism/internal/server
+                      │   old.txt   │              new.txt               │
+                      │   sec/op    │   sec/op     vs base               │
+Pipeline/stub-16        373.9n ± 2%   377.2n ± 2%       ~ (p=0.138 n=10)
+Pipeline/bare-16        4.123µ ± 1%   4.054µ ± 2%  -1.67% (p=0.004 n=10)
+Pipeline/full-16        4.493µ ± 1%   4.312µ ± 2%  -4.03% (p=0.000 n=10)
+Pipeline/cache_hit-16   2.480µ ± 2%   2.329µ ± 1%  -6.09% (p=0.000 n=10)
+geomean                 2.036µ        1.979µ       -2.76%
+
+                      │   old.txt    │                new.txt                 │
+                      │     B/op     │     B/op      vs base                  │
+Pipeline/stub-16          672.0 ± 0%     672.0 ± 0%        ~ (p=1.000 n=10) ¹
+Pipeline/bare-16        2.521Ki ± 0%   2.520Ki ± 0%        ~ (p=0.577 n=10)
+Pipeline/full-16        2.537Ki ± 0%   2.537Ki ± 0%        ~ (p=0.999 n=10)
+Pipeline/cache_hit-16    1073.0 ± 0%     881.0 ± 0%  -17.89% (p=0.000 n=10)
+geomean                 1.448Ki        1.378Ki        -4.82%
+¹ all samples are equal
+
+                      │   old.txt   │               new.txt                │
+                      │  allocs/op  │ allocs/op   vs base                  │
+Pipeline/stub-16         6.000 ± 0%   6.000 ± 0%        ~ (p=1.000 n=10) ¹
+Pipeline/bare-16         26.00 ± 0%   21.00 ± 0%  -19.23% (p=0.000 n=10)
+Pipeline/full-16         27.00 ± 0%   22.00 ± 0%  -18.52% (p=0.000 n=10)
+Pipeline/cache_hit-16   13.000 ± 0%   9.000 ± 0%  -30.77% (p=0.000 n=10)
+geomean                  15.30        12.57       -17.84%
+¹ all samples are equal

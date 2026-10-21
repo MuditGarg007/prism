@@ -148,9 +148,19 @@ func TestStoreLookup(t *testing.T) {
 
 func BenchmarkNotModified(b *testing.B) {
 	stored := http.Header{"Etag": {`"33a64df551425fcc55e4d42a148795d9f25f89d4"`}}
-	req := http.Header{"If-None-Match": {`"a", "33a64df551425fcc55e4d42a148795d9f25f89d4"`}}
-	b.ReportAllocs()
-	for b.Loop() {
-		NotModified(req, stored)
+	for _, bc := range []struct {
+		name string
+		req  http.Header
+	}{
+		{"etag", http.Header{"If-None-Match": {`"a", "33a64df551425fcc55e4d42a148795d9f25f89d4"`}}},
+		// Most requests are not conditional at all.
+		{"plain", http.Header{}},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				NotModified(bc.req, stored)
+			}
+		})
 	}
 }

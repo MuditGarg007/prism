@@ -1,0 +1,22 @@
+# Prism with what a production route usually has, for bench/run.sh: least
+# connections over two backends, a breaker, outlier detection, header
+# rules, a rate limit set high enough never to refuse, a body limit, a
+# concurrency cap and retries with a budget. Request IDs, tracing, metrics
+# and the access log are always on.
+listeners: [{ addr: "127.0.0.1:8090", timeouts: { read_header: 10s, idle: 120s } }]
+admin: { listen: "127.0.0.1:9901", pprof: true }
+upstreams:
+  app:
+    balancer: least_conn
+    backends: [{ url: "http://127.0.0.1:9101" }, { url: "http://127.0.0.1:9102" }]
+    circuit_breaker: { failure_ratio: 0.5, min_requests: 20, open_for: 30s }
+    outlier: { consecutive_failures: 5, base_ejection: 30s, max_ejection: 300s, max_ejection_percent: 50 }
+    max_idle_conns_per_host: 512
+routes:
+  - match: { path_prefix: / }
+    upstream: app
+    headers: { request_set: { X-Env: bench }, response_remove: [X-Backend] }
+    rate_limit: { per_ip: "10000000/s", burst: 1000000 }
+    max_body: 1MB
+    max_concurrency: 4096
+    retry: { attempts: 1, on: [connect_error, 502, 503], budget_ratio: 0.2 }

@@ -1,0 +1,10 @@
+# Prism with a route that does nothing but forward, for bench/run.sh. The
+# backend is a faultserver on 127.0.0.1:9101.
+listeners: [{ addr: "127.0.0.1:8090", timeouts: { read_header: 10s, idle: 120s } }]
+admin: { listen: "127.0.0.1:9901", pprof: true }
+upstreams:
+  app:
+    backends: [{ url: "http://127.0.0.1:9101" }]
+    max_idle_conns_per_host: 512
+routes:
+  - { match: { path_prefix: / }, upstream: app }

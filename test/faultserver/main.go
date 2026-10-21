@@ -26,6 +26,7 @@ func main() {
 	flag.IntVar(&f.ErrorStatus, "error-status", http.StatusServiceUnavailable, "status for injected errors")
 	flag.Float64Var(&f.DropRate, "drop-rate", 0, "share of responses cut off mid-body")
 	flag.IntVar(&f.BodySize, "body-size", 64, "bytes in a normal response")
+	flag.StringVar(&f.CacheControl, "cache-control", "", "Cache-Control sent on normal responses")
 	flag.Parse()
 	if *name == "" {
 		*name = *addr

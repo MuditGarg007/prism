@@ -91,6 +91,21 @@ func TestNewTrace(t *testing.T) {
 		if tr.Joined() || tr.ID == [16]byte{} || tr.ID == joined.ID || tr.SpanID == [8]byte{} || tr.Flags != traceSampled {
 			t.Errorf("trace started for %v = %+v", hdr, tr)
 		}
+		checkTraceHeader(t, &tr)
+	}
+	checkTraceHeader(t, &joined)
+}
+
+// checkTraceHeader checks that the traceparent and hex IDs newTrace keeps
+// match the trace's fields.
+func checkTraceHeader(t *testing.T, tr *Trace) {
+	t.Helper()
+	want := "00-" + hex.EncodeToString(tr.ID[:]) + "-" + hex.EncodeToString(tr.SpanID[:]) + "-" + hex.EncodeToString([]byte{tr.Flags})
+	if got := tr.traceparent(); got != want {
+		t.Errorf("traceparent = %q, want %q", got, want)
+	}
+	if id, span := tr.HexIDs(); id != hex.EncodeToString(tr.ID[:]) || span != hex.EncodeToString(tr.SpanID[:]) {
+		t.Errorf("HexIDs = %q, %q for %+v", id, span, tr)
 	}
 }
 

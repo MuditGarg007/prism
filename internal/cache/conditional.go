@@ -15,12 +15,12 @@ func NotModified(req, h http.Header) bool {
 	if inm, ok := req["If-None-Match"]; ok {
 		return etagListMatch(inm, h.Get("Etag"))
 	}
-	ims, err := http.ParseTime(req.Get("If-Modified-Since"))
-	if err != nil {
+	ims, ok := parseTime(req.Get("If-Modified-Since"))
+	if !ok {
 		return false
 	}
-	lm, err := http.ParseTime(h.Get("Last-Modified"))
-	return err == nil && !lm.After(ims)
+	lm, ok := parseTime(h.Get("Last-Modified"))
+	return ok && !lm.After(ims)
 }
 
 // etagListMatch reports whether an If-None-Match list matches etag by weak

@@ -56,25 +56,34 @@ func (f *Forwarding) Apply(out http.Header, peer netip.Addr, host string, isTLS 
 	if isTLS {
 		proto = "https"
 	}
+	// One array backs every value set here, which saves an allocation per
+	// header on each request. Each value is capped, so appending to one
+	// copies it rather than writing over the next.
+	vals := make([]string, 0, 4)
+	set := func(name, v string) {
+		vals = append(vals, v)
+		n := len(vals)
+		out[name] = vals[n-1 : n : n]
+	}
 
 	switch {
 	case !peer.IsValid():
 		// There is no address to name, and nothing earlier can be trusted.
 		delete(out, "X-Forwarded-For")
 	case trusted && len(out["X-Forwarded-For"]) > 0:
-		out.Set("X-Forwarded-For", strings.Join(out["X-Forwarded-For"], ", ")+", "+peer.String())
+		set("X-Forwarded-For", strings.Join(out["X-Forwarded-For"], ", ")+", "+peer.String())
 	default:
-		out.Set("X-Forwarded-For", peer.String())
+		set("X-Forwarded-For", peer.String())
 	}
 
 	if !trusted || out.Get("X-Forwarded-Proto") == "" {
-		out.Set("X-Forwarded-Proto", proto)
+		set("X-Forwarded-Proto", proto)
 	}
 	if !trusted || out.Get("X-Forwarded-Host") == "" {
 		if host == "" {
 			delete(out, "X-Forwarded-Host")
 		} else {
-			out.Set("X-Forwarded-Host", host)
+			set("X-Forwarded-Host", host)
 		}
 	}
 
@@ -86,7 +95,7 @@ func (f *Forwarding) Apply(out http.Header, peer netip.Addr, host string, isTLS 
 		if prior := out["Forwarded"]; len(prior) > 0 {
 			elem = strings.Join(prior, ", ") + ", " + elem
 		}
-		out.Set("Forwarded", elem)
+		set("Forwarded", elem)
 	}
 }
 

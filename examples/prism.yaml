@@ -36,7 +36,9 @@ cache: { max_size: 64MB }
 # GET /upstreams (live health, inflight and breaker state), GET /config (the
 # effective config, URL passwords masked), POST /reload, POST /cache/purge
 # and GET /cache/stats. Keep it on loopback; it has no authentication.
-admin: { listen: "127.0.0.1:9901" }
+# pprof: true adds Go's profiler under /debug/pprof/, for example
+#   go tool pprof http://127.0.0.1:9901/debug/pprof/profile?seconds=30
+admin: { listen: "127.0.0.1:9901", pprof: false }
 
 # Refuses requests by client IP (after trusted_proxies) with 403, before
 # routing. deny wins; when allow is set, only clients in it get through.

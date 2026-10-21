@@ -109,7 +109,8 @@ func logRequest(log *slog.Logger, r *http.Request, lw *logWriter, d time.Duratio
 		attrs = append(attrs, slog.String("request_id", an.RequestID))
 	}
 	if t := &an.Trace; t.ID != [16]byte{} {
-		attrs = append(attrs, slog.String("trace_id", hex.EncodeToString(t.ID[:])), slog.String("span_id", hex.EncodeToString(t.SpanID[:])))
+		traceID, spanID := t.HexIDs()
+		attrs = append(attrs, slog.String("trace_id", traceID), slog.String("span_id", spanID))
 		if t.Joined() {
 			attrs = append(attrs, slog.String("parent_id", hex.EncodeToString(t.Parent[:])))
 		}

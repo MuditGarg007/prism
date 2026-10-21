@@ -533,8 +533,10 @@ func (h *Handler) outgoing(r *http.Request, rt *Route, b *upstream.Backend, rb *
 		hdr["Upgrade"] = []string{"websocket"}
 	}
 	h.fwd.Apply(hdr, PeerAddr(r.RemoteAddr), r.Host, r.TLS != nil)
-	hdr[RequestIDHeader] = []string{an.RequestID}
-	an.Trace.propagate(hdr)
+	// One array for both values, each capped so an append to one copies it.
+	ids := []string{an.RequestID, an.Trace.traceparent()}
+	hdr[RequestIDHeader] = ids[0:1:1]
+	an.Trace.propagate(hdr, ids[1:2:2])
 	if rt.Auth != nil {
 		rt.Auth.Prepare(hdr, an.User)
 	}

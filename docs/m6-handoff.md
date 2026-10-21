@@ -1,6 +1,6 @@
 # M6 handoff
 
-As of 2026-10-20, M6 (advanced routing and security) is complete: all 10 steps are done, and `make lint test validate` passes with `-race`. The exit tests in `test/e2e/m6_test.go` pass, three runs in a row. Nothing from M6 is committed yet; commit only when the user asks. Next is M7.
+As of 2026-10-20, M6 (advanced routing and security) is complete: all 10 steps are done, and `make lint test validate` passes with `-race`. The exit tests in `test/e2e/m6_test.go` pass, three runs in a row. It was committed on 2026-10-21 as `81f0422`. Next is M7.
 
 - The repo lives at `/home/mudit/prism`. The module is `github.com/MuditGarg007/prism`, on Go 1.27.
 - M6 builds on `2a87a3a` (M5).

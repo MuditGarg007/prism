@@ -123,6 +123,16 @@ func TestForwardingApply(t *testing.T) {
 			if !reflect.DeepEqual(tt.in, tt.want) {
 				t.Errorf("got  %v\nwant %v", tt.in, tt.want)
 			}
+			// The values Apply sets share an array, so an append to one, as
+			// Header.Add does, must not write over another.
+			want := tt.in.Clone()
+			for k := range tt.in {
+				tt.in.Add(k, "added")
+				want.Add(k, "added")
+			}
+			if !reflect.DeepEqual(tt.in, want) {
+				t.Errorf("after Add: got  %v\nwant %v", tt.in, want)
+			}
 		})
 	}
 }

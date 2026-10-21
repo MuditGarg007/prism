@@ -227,3 +227,34 @@ func TestReloadEndpoint(t *testing.T) {
 		t.Errorf("without a reloader: %d, want 404", rec.Code)
 	}
 }
+
+func TestPprof(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		cfg, err := config.Parse(fmt.Appendf(nil, `
+listeners: [{ addr: ":8080" }]
+admin: { listen: "127.0.0.1:9901", pprof: %t }
+upstreams:
+  web: { backends: [{ url: "http://127.0.0.1:1" }] }
+routes:
+  - { match: { path_prefix: / }, upstream: web }
+`, on), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt, err := runtime.Build(cfg, discard, runtime.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(rt.Close)
+		h := New(runtime.NewCurrent(rt), nil, nil, discard)
+		want := http.StatusNotFound
+		if on {
+			want = http.StatusOK
+		}
+		for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap?debug=1", "/debug/pprof/cmdline"} {
+			if rec := do(h, "GET", path, ""); rec.Code != want {
+				t.Errorf("pprof %t: GET %s = %d, want %d", on, path, rec.Code, want)
+			}
+		}
+	}
+}

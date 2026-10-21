@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 
-.PHONY: all build test vet staticcheck lint bench fuzz validate chaos reload clean
+.PHONY: all build test vet staticcheck lint bench bench-compare fuzz validate chaos reload clean
 
 all: lint test
 
@@ -22,6 +22,12 @@ lint: vet staticcheck
 
 bench:
 	go test -run='^$$' -bench=. -benchmem ./...
+
+# About 25 minutes: a direct backend, nginx (in Docker) and Prism under
+# vegeta. Results go to bin/bench/results.md and latency.svg. QUICK=1 for a
+# short trial run.
+bench-compare:
+	bench/run.sh
 
 fuzz:
 	go test -run='^$$' -fuzz=FuzzParse -fuzztime=30s ./internal/config

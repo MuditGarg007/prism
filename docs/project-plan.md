@@ -240,6 +240,13 @@ Build these together.
 - Profile the hot path and fix the top 2–3 allocation sources, such as header copying and buffer pooling.
 - Write a README with an architecture diagram, design decisions and their tradeoffs, and a "what's not supported" section.
 
+**Status:** done on 2026-10-21. The decisions and details are in `docs/m7-handoff.md`. As built:
+
+- `make bench-compare` (`bench/run.sh`) compares a direct backend, nginx 1.28 in Docker and Prism under vegeta, with CPU pinning, fresh processes and a warm-up per scenario, and the median of three runs at 5,000 and 20,000 req/s plus closed loop. `bench/report` writes `results.md` and a latency-by-percentile SVG. The checked-in results are in `docs/bench/`.
+- Results: Prism forwards about 70% of nginx's requests per second at about 2.4 times its CPU per request, adds 84 µs at the median at 5,000 req/s, and matches nginx on cache hits. Its maximum latency (13–28 ms) is well above nginx's.
+- `BenchmarkPipeline` measures Prism's own cost per request without sockets, and `admin: {pprof: true}` serves the profiler for the real binary. Three allocation fixes from the profiles (empty date headers, the forwarding headers sharing one array, the traceparent formatted once) cut allocations per request from 26 to 21 (bare), 27 to 22 (full) and 13 to 9 (cache hit), per `benchstat`.
+- The README has the architecture diagrams, design decisions and tradeoffs, the benchmark table, the chaos graphs, the test strategy and a "what's not supported" section.
+
 ### Later, if ever
 
 A disk cache, HTTP/3 via quic-go, adaptive concurrency limits, and ACME/autocert.
