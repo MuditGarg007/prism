@@ -1,0 +1,20 @@
+# For docs/concepts/rate-limits-and-overload.md. Backends come from
+# scripts/lab-backends.sh.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+upstreams:
+  app: { backends: [{ url: "http://127.0.0.1:9101" }] }
+
+routes:
+  # On average 2 requests a second per client, in bursts of up to 4.
+  - match: { path_prefix: "/rate/" }
+    upstream: app
+    rate_limit: { per_ip: "2/s", burst: 4 }
+
+  # 2 requests at once, and up to 2 more may wait up to 3s for a slot.
+  - match: { path_prefix: "/slots/" }
+    upstream: app
+    max_concurrency: 2
+    queue_size: 2
+    queue_timeout: 3s

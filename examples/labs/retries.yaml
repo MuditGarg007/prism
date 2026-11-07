@@ -1,0 +1,19 @@
+# For docs/concepts/timeouts-and-retries.md. Backends come from
+# scripts/lab-backends.sh.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+upstreams:
+  app:
+    timeouts: { connect: 1s, response_header: 500ms }
+    backends:
+      - { url: "http://127.0.0.1:9101" }
+      - { url: "http://127.0.0.1:9102" }
+
+routes:
+  - match: { path_prefix: "/retry/" }
+    upstream: app
+    retry: { attempts: 1, on: [connect_error, timeout, 503] }
+
+  - match: { path_prefix: "/noretry/" }
+    upstream: app

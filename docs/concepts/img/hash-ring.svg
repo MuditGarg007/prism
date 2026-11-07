@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" width="760" font-family="Helvetica,Arial,sans-serif">
+<rect width="760" height="400" fill="#ffffff"/>
+<text x="24" y="32" font-size="18" font-weight="bold" fill="#111">Consistent hashing: each client walks clockwise to the next point</text>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="#374151"/></marker></defs>
+<path d="M295.0 79.0 A150 150 0 0 1 319.4 109.9" fill="none" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M348.9 266.8 A150 150 0 0 1 322.7 296.3" fill="none" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M173.2 352.5 A150 150 0 0 1 151.0 337.5" fill="none" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M91.9 109.3 A150 150 0 0 1 124.8 87.7" fill="none" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/>
+<circle cx="210" cy="205" r="130" fill="none" stroke="#9ca3af" stroke-width="3"/>
+<circle cx="232.6" cy="77.0" r="11" fill="#2563eb"/>
+<text x="232.6" y="82.0" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">a</text>
+<circle cx="309.6" cy="121.4" r="11" fill="#d97706"/>
+<text x="309.6" y="126.4" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">b</text>
+<circle cx="339.5" cy="193.7" r="11" fill="#059669"/>
+<text x="339.5" y="198.7" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">c</text>
+<circle cx="309.6" cy="288.6" r="11" fill="#2563eb"/>
+<text x="309.6" y="293.6" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">a</text>
+<circle cx="243.6" cy="330.6" r="11" fill="#059669"/>
+<text x="243.6" y="335.6" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">c</text>
+<circle cx="155.1" cy="322.8" r="11" fill="#d97706"/>
+<text x="155.1" y="327.8" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">b</text>
+<circle cx="92.2" cy="259.9" r="11" fill="#2563eb"/>
+<text x="92.2" y="264.9" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">a</text>
+<circle cx="84.4" cy="171.4" r="11" fill="#d97706"/>
+<text x="84.4" y="176.4" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">b</text>
+<circle cx="135.4" cy="98.5" r="11" fill="#059669"/>
+<text x="135.4" y="103.5" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">c</text>
+<rect x="275.0" y="62.4" width="22" height="22" rx="4" fill="#111"/>
+<text x="286.0" y="78.4" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">1</text>
+<rect x="341.8" y="246.0" width="22" height="22" rx="4" fill="#111"/>
+<text x="352.8" y="262.0" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">2</text>
+<rect x="172.6" y="343.7" width="22" height="22" rx="4" fill="#111"/>
+<text x="183.6" y="359.7" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">3</text>
+<rect x="74.5" y="106.8" width="22" height="22" rx="4" fill="#111"/>
+<text x="85.5" y="122.8" font-size="13" font-weight="bold" fill="#fff" text-anchor="middle">4</text>
+<text x="430" y="88" font-size="15" fill="#111" font-weight="bold">Colored circles are points on the ring.</text>
+<text x="430" y="109" font-size="15" fill="#111">Each backend owns many points, placed</text>
+<text x="430" y="130" font-size="15" fill="#111">by hashing its URL and a counter.</text>
+<text x="430" y="151" font-size="15" fill="#111"></text>
+<text x="430" y="172" font-size="15" fill="#111" font-weight="bold">Black squares are clients.</text>
+<text x="430" y="193" font-size="15" fill="#111">A client hashes its IP to a position, and</text>
+<text x="430" y="214" font-size="15" fill="#111">belongs to the next point clockwise.</text>
+<text x="430" y="235" font-size="15" fill="#111"></text>
+<text x="430" y="256" font-size="15" fill="#111" font-weight="bold">When a backend leaves,</text>
+<text x="430" y="277" font-size="15" fill="#111">only its clients move, each to the next</text>
+<text x="430" y="298" font-size="15" fill="#111">point. Everyone else stays where they are.</text>
+<text x="430" y="319" font-size="15" fill="#111"></text>
+<text x="430" y="340" font-size="15" fill="#111" font-weight="bold">When a backend joins,</text>
+<text x="430" y="361" font-size="15" fill="#111">it takes over about 1/N of the clients.</text>
+</svg>

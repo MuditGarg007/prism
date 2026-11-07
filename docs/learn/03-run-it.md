@@ -285,10 +285,10 @@ Press Ctrl-C in Prism's terminal, or send `SIGTERM`. Prism stops accepting conne
 | you did | Prism used | learn more in |
 | --- | --- | --- |
 | sent a request | routing, header rewriting, forwarding | [Life of a request](05-life-of-a-request.md) |
-| repeated requests | round robin | concepts: load balancing |
+| repeated requests | round robin | [Load balancing](../concepts/load-balancing.md) |
 | asked for a page twice | response cache | concepts: HTTP caching |
-| sent too many requests | rate limiter | concepts: rate limits |
-| killed a backend | retries, health checks | concepts: failure handling |
+| sent too many requests | rate limiter | [Rate limits and overload](../concepts/rate-limits-and-overload.md) |
+| killed a backend | retries, health checks | [Timeouts and retries](../concepts/timeouts-and-retries.md), [Detecting failure](../concepts/detecting-failure.md) |
 | edited the config | atomic snapshot swap | concepts: hot reload |
 
 Next: [Codebase tour](04-codebase-tour.md).

@@ -1,0 +1,27 @@
+# For docs/concepts/load-balancing.md. Backends come from
+# scripts/lab-backends.sh. One route per balancer, over the same backends.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+admin: { listen: "127.0.0.1:9901" }
+
+# The lab pretends to be a load balancer, so that curl can play many clients
+# by sending X-Forwarded-For.
+trusted_proxies: ["127.0.0.1"]
+
+upstreams:
+  rr:
+    balancer: round_robin
+    backends: &backends
+      - { url: "http://127.0.0.1:9101", weight: 5 }
+      - { url: "http://127.0.0.1:9102", weight: 1 }
+      - { url: "http://127.0.0.1:9103", weight: 1 }
+  weighted: { balancer: weighted, backends: *backends }
+  least: { balancer: least_conn, backends: *backends }
+  hash: { balancer: ip_hash, backends: *backends }
+
+routes:
+  - { match: { path_prefix: "/rr/" }, upstream: rr }
+  - { match: { path_prefix: "/weighted/" }, upstream: weighted }
+  - { match: { path_prefix: "/least/" }, upstream: least }
+  - { match: { path_prefix: "/hash/" }, upstream: hash }

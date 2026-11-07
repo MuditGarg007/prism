@@ -321,4 +321,4 @@ sequenceDiagram
 
 ## Where to go next
 
-You now have the whole map. The `concepts/` pages will each zoom into one box on the flowchart. To explore before then, pick a feature you found interesting, find its box here, and read its package. They're small, and the comments explain why things are the way they are.
+You now have the whole map. The [concept pages](../README.md#concepts) each zoom into one box on the flowchart, and you can read them in any order. A good first pick is [Load balancing](../concepts/load-balancing.md) or [Detecting failure](../concepts/detecting-failure.md).

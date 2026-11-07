@@ -1,0 +1,25 @@
+# For docs/concepts/detecting-failure.md. Backends come from
+# scripts/lab-backends.sh. The numbers are small so that things happen fast.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+admin: { listen: "127.0.0.1:9901" }
+
+upstreams:
+  breaker:
+    backends:
+      - { url: "http://127.0.0.1:9101" }
+      - { url: "http://127.0.0.1:9102" }
+    circuit_breaker: { failure_ratio: 0.5, min_requests: 10, window: 10s, open_for: 5s, half_open_probes: 2 }
+
+  outlier:
+    backends:
+      - { url: "http://127.0.0.1:9103" }
+      - { url: "http://127.0.0.1:9102" }
+    outlier: { consecutive_failures: 3, base_ejection: 5s, max_ejection: 30s }
+
+routes:
+  - match: { path_prefix: "/breaker/" }
+    upstream: breaker
+  - match: { path_prefix: "/outlier/" }
+    upstream: outlier

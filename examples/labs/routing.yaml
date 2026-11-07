@@ -1,0 +1,23 @@
+# For docs/concepts/routing.md. Backends come from scripts/lab-backends.sh.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+upstreams:
+  a: { backends: [{ url: "http://127.0.0.1:9101" }] }
+  b: { backends: [{ url: "http://127.0.0.1:9102" }] }
+  c: { backends: [{ url: "http://127.0.0.1:9103" }] }
+
+routes:
+  # An exact host.
+  - match: { host: "api.example.com", path_prefix: "/v1/" }
+    upstream: a
+  # A wildcard host: any subdomain of example.com.
+  - match: { host: "*.example.com", path_prefix: "/" }
+    upstream: b
+  # No host: everything else.
+  - match: { path_prefix: "/" }
+    upstream: c
+  - match: { path_prefix: "/api" }
+    upstream: a
+  - match: { path_prefix: "/docs/" }
+    upstream: b

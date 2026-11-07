@@ -1,0 +1,20 @@
+# For docs/concepts/forwarding-and-streaming.md. Backends come from
+# scripts/lab-backends.sh, and the stream route from the small script on
+# that page.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+upstreams:
+  app: { backends: [{ url: "http://127.0.0.1:9101" }] }
+  stream: { backends: [{ url: "http://127.0.0.1:9104" }] }
+
+routes:
+  - match: { path_prefix: "/app/" }
+    upstream: app
+    headers:
+      request_set: { X-Env: lab }
+      response_set: { X-Served-By: prism }
+      response_remove: [X-Backend]
+
+  - match: { path_prefix: "/stream/" }
+    upstream: stream
