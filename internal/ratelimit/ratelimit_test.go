@@ -114,6 +114,28 @@ func TestRetryAfterIsExact(t *testing.T) {
 	}
 }
 
+func TestPeekSpendsNothing(t *testing.T) {
+	l, clk := withClock(New(1, time.Second, 2))
+	for range 5 {
+		if ok, _ := l.Peek(ipA); !ok {
+			t.Fatal("Peek refused a fresh key")
+		}
+	}
+	if l.keys() != 0 {
+		t.Errorf("Peek stored %d keys, want none", l.keys())
+	}
+	l.Allow(ipA)
+	l.Allow(ipA)
+	ok, wait := l.Peek(ipA)
+	if ok || wait != time.Second {
+		t.Fatalf("Peek after the burst = %v, %v; want false, 1s", ok, wait)
+	}
+	clk.advance(wait)
+	if ok, _ := l.Peek(ipA); !ok {
+		t.Error("Peek refused at the retry time")
+	}
+}
+
 func TestSteadyRate(t *testing.T) {
 	l, clk := withClock(New(100, time.Second, 1))
 	for i := range 1000 {
@@ -188,6 +210,10 @@ func TestFloodIsBounded(t *testing.T) {
 	if ok, _ := l.Allow(addr(n - 1)); ok {
 		t.Error("the newest client was not limited")
 	}
+	// Every key beyond the cap displaced a live one.
+	if got, want := l.Evictions(), uint64(n-l.keys()); got != want {
+		t.Errorf("counted %d evictions, want %d", got, want)
+	}
 }
 
 // TestIdleKeysAreSwept checks that keys whose bucket has refilled are
@@ -209,6 +235,10 @@ func TestIdleKeysAreSwept(t *testing.T) {
 	// during the second wave, dropping every key from the first.
 	if got := l.keys(); got > n+shards*sweepEvery {
 		t.Errorf("holding %d keys, want at most %d", got, n+shards*sweepEvery)
+	}
+	// Idle keys are dropped by sweeps, which are not evictions.
+	if got := l.Evictions(); got != 0 {
+		t.Errorf("counted %d evictions of idle keys, want 0", got)
 	}
 }
 
@@ -259,6 +289,9 @@ func FuzzGCRA(f *testing.F) {
 				credit -= interval
 			} else {
 				wantWait = time.Duration(interval - credit)
+			}
+			if ok, wait := l.Peek(ipA); ok != wantOK || wait != wantWait {
+				t.Fatalf("request %d: Peek = %v, %v; token bucket says %v, %v", i, ok, wait, wantOK, wantWait)
 			}
 			ok, wait := l.Allow(ipA)
 			if ok != wantOK || wait != wantWait {

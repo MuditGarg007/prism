@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"maps"
 	"math"
-	"net"
 	"net/http"
 	"net/netip"
 	"reflect"
@@ -77,9 +76,6 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 			rt.Retire(prev) // prev is still serving with what it shares
 		}
 	}()
-	if a := cfg.Admin; a != nil && !loopback(a.Listen) {
-		log.Warn("admin API listens beyond loopback and has no authentication", "addr", a.Listen)
-	}
 	// One store for the whole process, built only when some route uses it.
 	// A reload keeps the entries, the fetches in progress and the counters.
 	if slices.ContainsFunc(cfg.Routes, caches) {
@@ -144,9 +140,9 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 	for i, r := range cfg.Routes {
 		name := r.Match.Host + r.Match.PathPrefix
 		old, hasOld := prevRoutes[name]
-		if r.Auth != nil && r.Auth.Basic != nil && r.RateLimit == nil {
-			// Only the route's rate limit slows password guessing.
-			log.Warn("route checks passwords but has no rate_limit, so guessing is limited only by bcrypt", "route", name)
+		if a := r.Auth; a != nil && a.Basic != nil && a.FailureLimit.Off && r.RateLimit == nil {
+			// Nothing slows password guessing but bcrypt.
+			log.Warn("route checks passwords with failure_limit off and no rate_limit, so guessing is limited only by bcrypt", "route", name)
 		}
 		pool, ok := rt.Pools[r.Upstream]
 		if !ok {
@@ -178,13 +174,14 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 		if caches(r) {
 			c := r.Cache
 			pc = &proxy.Cache{
-				Store:        rt.Cache.Store,
-				Flight:       rt.Cache.Flight,
-				Stats:        rt.Cache.Stats,
-				MaxObject:    int64(c.MaxObject),
-				LockTimeout:  c.LockTimeout,
-				BypassHeader: http.CanonicalHeaderKey(c.BypassHeader),
-				StaleIfError: c.StaleIfError,
+				Store:                rt.Cache.Store,
+				Flight:               rt.Cache.Flight,
+				Stats:                rt.Cache.Stats,
+				MaxObject:            int64(c.MaxObject),
+				LockTimeout:          c.LockTimeout,
+				BypassHeader:         http.CanonicalHeaderKey(c.BypassHeader),
+				StaleIfError:         c.StaleIfError,
+				StaleWhileRevalidate: c.StaleWhileRevalidate,
 			}
 		}
 		var sem *limits.Semaphore
@@ -258,7 +255,7 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 			if hasOld && old.route.Auth != nil && reflect.DeepEqual(old.cfg.Auth, a) {
 				route.Auth = old.route.Auth
 			} else {
-				route.Auth = authenticator(a)
+				route.Auth = NewAuthenticator(a)
 			}
 		}
 		rt.Routes = append(rt.Routes, route)
@@ -294,8 +291,13 @@ func Build(cfg *config.Config, log *slog.Logger, opts Options) (_ *Runtime, err 
 	return rt, nil
 }
 
-func authenticator(a *config.Auth) *security.Authenticator {
+// NewAuthenticator returns the authenticator for an auth block, a route's
+// or the admin API's.
+func NewAuthenticator(a *config.Auth) *security.Authenticator {
 	c := security.AuthConfig{Forward: a.ForwardCredentials, IdentityHeader: a.IdentityHeader}
+	if f := a.FailureLimit; !f.Off {
+		c.FailureCount, c.FailurePer = f.Count, f.Per
+	}
 	if b := a.Basic; b != nil {
 		c.Realm, c.Users = b.Realm, b.Users
 	}
@@ -324,20 +326,6 @@ func prefixes(ps []config.Prefix) []netip.Prefix {
 
 func sameBudget(a, b *config.Retry) bool {
 	return a != nil && a.BudgetRatio == b.BudgetRatio && a.BudgetMinPerSec == b.BudgetMinPerSec
-}
-
-// loopback reports whether addr only accepts connections from this host.
-// An empty host listens on every interface.
-func loopback(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	if host == "localhost" {
-		return true
-	}
-	ip, err := netip.ParseAddr(host)
-	return err == nil && ip.IsLoopback()
 }
 
 // Start starts the background work of rt, which is active health checking.

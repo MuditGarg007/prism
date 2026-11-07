@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/MuditGarg007/prism/internal/config"
+	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/runtime"
 )
 
@@ -81,7 +82,7 @@ func TestCacheStats(t *testing.T) {
 	if st.Entries != 2 || st.Bytes <= 0 || st.MaxBytes != 2<<20 || st.Hit != 1 || st.Miss != 2 {
 		t.Errorf("stats = %+v", st)
 	}
-	for _, field := range []string{`"entries"`, `"max_bytes"`, `"evictions"`, `"waiting"`, `"revalidated"`, `"bypass"`} {
+	for _, field := range []string{`"entries"`, `"max_bytes"`, `"evictions"`, `"waiting"`, `"revalidated"`, `"bypass"`, `"updating"`} {
 		if !strings.Contains(rec.Body.String(), field) {
 			t.Errorf("body %s lacks %s", rec.Body, field)
 		}
@@ -256,5 +257,89 @@ routes:
 				t.Errorf("pprof %t: GET %s = %d, want %d", on, path, rec.Code, want)
 			}
 		}
+	}
+}
+
+// testHash is a bcrypt hash of "s3cret" at the lowest cost, and testDigest
+// the SHA-256 digest of the key "key-one".
+const (
+	testHash   = "$2a$04$2Waq0k1CQGjrchXQb2AjfOg3u7OIuziqivVBEfq8R8TWIsZG3IYrC"
+	testDigest = "sha256:9b346041bc9a49574eb2665b2ad2a0a3f9f9cce4e42f5d1f26deb8a256b5966a"
+)
+
+func TestAuth(t *testing.T) {
+	cfg, err := config.Parse(fmt.Appendf(nil, `
+listeners: [{ addr: ":8080" }]
+admin:
+  listen: "0.0.0.0:9901"
+  auth:
+    basic: { realm: admin, users: { ops: %q } }
+    api_keys: { header: Authorization, keys: { prometheus: %q } }
+    failure_limit: 3/m
+upstreams:
+  web: { backends: [{ url: "http://127.0.0.1:1" }] }
+routes:
+  - { match: { path_prefix: / }, upstream: web }
+`, testHash, testDigest), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := runtime.Build(cfg, discard, runtime.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rt.Close)
+	h := New(runtime.NewCurrent(rt), observability.NewMetrics(), func() error { return nil }, discard)
+
+	send := func(client, method, path, authz string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.RemoteAddr = client + ":5000"
+		if authz != "" {
+			req.Header.Set("Authorization", authz)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	basic := func(user, pass string) string {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.SetBasicAuth(user, pass)
+		return req.Header.Get("Authorization")
+	}
+
+	rec := send("192.0.2.1", "GET", "/routes", "")
+	if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") != `Basic realm="admin", charset="UTF-8"` {
+		t.Errorf("no credentials: %d, WWW-Authenticate %q; want 401 with a Basic challenge", rec.Code, rec.Header().Get("WWW-Authenticate"))
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Error("401 without Cache-Control: no-store")
+	}
+	for _, authz := range []string{basic("ops", "s3cret"), "Bearer key-one"} {
+		if rec := send("192.0.2.1", "GET", "/routes", authz); rec.Code != http.StatusOK {
+			t.Errorf("%s: GET /routes = %d, want 200", authz, rec.Code)
+		}
+	}
+	if rec := send("192.0.2.1", "POST", "/reload", "Bearer key-one"); rec.Code != http.StatusOK {
+		t.Errorf("POST /reload with a key = %d, want 200", rec.Code)
+	}
+
+	// Three wrong tries, then even the right key is refused for a while.
+	for _, authz := range []string{basic("ops", "nope"), "Bearer key-two", basic("root", "s3cret")} {
+		if rec := send("192.0.2.9", "GET", "/config", authz); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: %d, want 401", authz, rec.Code)
+		}
+	}
+	rec = send("192.0.2.9", "GET", "/config", "Bearer key-one")
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "20" {
+		t.Errorf("after 3 failures: %d, Retry-After %q; want 429, 20", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if rec := send("192.0.2.1", "GET", "/config", "Bearer key-one"); rec.Code != http.StatusOK {
+		t.Errorf("another client: %d, want 200", rec.Code)
+	}
+
+	// Prometheus scrapes with its key, and sees the admin API's limiter.
+	rec = send("192.0.2.1", "GET", "/metrics", "Bearer key-one")
+	if want := `prism_ratelimit_evictions_total{limit="auth_failures",route="admin"} 0`; rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), want+"\n") {
+		t.Errorf("GET /metrics with a key: %d, want 200 with %q", rec.Code, want)
 	}
 }

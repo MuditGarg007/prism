@@ -11,7 +11,9 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/MuditGarg007/prism/internal/config"
 	"github.com/MuditGarg007/prism/internal/resilience"
@@ -78,10 +80,22 @@ type Backend struct {
 // state is what requests and health checks change on a backend. It is
 // shared by every Runtime's Backend for the same upstream and URL, so a
 // reload keeps least_conn's view of the load, and requests still running on
-// the old Runtime release into the same count.
+// the old Runtime release into the same count. Health checks keep their
+// record here for the same reason: a reload's new checker carries on the
+// old one's streak and schedule.
 type state struct {
 	inflight  atomic.Int64
 	unhealthy atomic.Bool // inverted so a new state is available
+
+	mu     sync.Mutex
+	health HealthRecord
+}
+
+// HealthRecord is what health checking remembers about a backend besides
+// whether it is healthy.
+type HealthRecord struct {
+	Streak int       // consecutive check results that disagree with Healthy
+	Due    time.Time // when the next check is due; zero before checks start
 }
 
 // NewBackend returns an available backend with no transport, breaker or
@@ -154,6 +168,20 @@ func (b *Backend) Breaker() *resilience.Breaker { return b.breaker }
 
 // SetHealthy records the result of health checking b.
 func (b *Backend) SetHealthy(ok bool) { b.state.unhealthy.Store(!ok) }
+
+// HealthRecord returns b's health check record.
+func (b *Backend) HealthRecord() HealthRecord {
+	b.state.mu.Lock()
+	defer b.state.mu.Unlock()
+	return b.state.health
+}
+
+// SetHealthRecord replaces b's health check record.
+func (b *Backend) SetHealthRecord(r HealthRecord) {
+	b.state.mu.Lock()
+	b.state.health = r
+	b.state.mu.Unlock()
+}
 
 // Healthy reports whether health checking last found b healthy. A backend
 // without health checks is always healthy.
@@ -243,11 +271,13 @@ func NewPool(name string, u *config.Upstream, newBal NewBalancer, log *slog.Logg
 // NewPool leaves out, so that a reload that fails after NewPool never
 // touches the pool still serving. Without health checks, every backend is
 // marked healthy, or one that the previous config's checks marked down
-// would stay down for good.
+// would stay down for good, and its record is cleared, so checks turned on
+// again later start afresh.
 func (p *Pool) Commit() {
 	if p.cfg.Health == nil {
 		for _, b := range p.Backends {
 			b.SetHealthy(true)
+			b.SetHealthRecord(HealthRecord{})
 		}
 	}
 }

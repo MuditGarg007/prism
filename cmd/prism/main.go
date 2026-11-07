@@ -35,6 +35,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn or error")
 	logFormat := fs.String("log-format", "text", "log format: text or json")
 	showVersion := fs.Bool("version", false, "print the version and exit")
+	var logBuffer config.ByteSize
+	fs.Func("log-buffer", "buffer up to this much log output (such as 64KB), flushed every second; 0 writes each line at once", func(s string) error {
+		v, err := config.ParseByteSize(s)
+		if err == nil && (v < 0 || v > 64<<20) {
+			err = errors.New("must be between 0 and 64MB")
+		}
+		logBuffer = v
+		return err
+	})
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -47,6 +56,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	if logBuffer > 0 {
+		// Everything after this point goes through the buffer, so error
+		// messages keep their place among the log lines.
+		bw := observability.NewBufferedWriter(stderr, int(logBuffer), observability.FlushInterval)
+		defer bw.Close()
+		stderr = bw
+	}
 	logger, err := observability.NewLogger(stderr, *logLevel, *logFormat)
 	if err != nil {
 		fmt.Fprintln(stderr, "prism:", err)

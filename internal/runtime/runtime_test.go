@@ -88,48 +88,31 @@ func TestBuildExample(t *testing.T) {
 }
 
 func TestBuildBasicAuthWarning(t *testing.T) {
-	for _, rl := range []string{"", ", rate_limit: { per_ip: 10/s }"} {
+	tests := []struct {
+		extra string // added to the route
+		auth  string // added to its auth
+		warn  bool
+	}{
+		{"", "", false}, // the default failure limit
+		{"", ", failure_limit: off", true},
+		{", rate_limit: { per_ip: 10/s }", ", failure_limit: off", false},
+	}
+	for _, tt := range tests {
 		cfg := parse(t, fmt.Sprintf(`
 listeners: [{ addr: ":8080" }]
 upstreams:
   web: { backends: [{ url: "http://127.0.0.1:1" }] }
 routes:
-  - { match: { path_prefix: / }, upstream: web, auth: { basic: { users: { alice: %q } } }%s }
-`, testHash, rl), "")
+  - { match: { path_prefix: / }, upstream: web, auth: { basic: { users: { alice: %q } }%s }%s }
+`, testHash, tt.auth, tt.extra), "")
 		var logs bytes.Buffer
 		rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)), Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		rt.Close()
-		if warned := strings.Contains(logs.String(), "no rate_limit"); warned != (rl == "") {
-			t.Errorf("rate limit %q: warned %v; logs %q", rl, warned, logs.String())
-		}
-	}
-}
-
-func TestBuildAdminWarning(t *testing.T) {
-	for _, tt := range []struct {
-		listen string
-		warn   bool
-	}{
-		{"127.0.0.1:9901", false},
-		{"[::1]:9901", false},
-		{"localhost:9901", false},
-		{":9901", true},
-		{"0.0.0.0:9901", true},
-		{"10.0.0.1:9901", true},
-	} {
-		cfg := singleUpstream(t, "http://127.0.0.1:9000")
-		cfg.Admin = &config.Admin{Listen: tt.listen}
-		var logs bytes.Buffer
-		rt, err := Build(cfg, slog.New(slog.NewTextHandler(&logs, nil)), Options{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		rt.Close()
-		if got := strings.Contains(logs.String(), "beyond loopback"); got != tt.warn {
-			t.Errorf("%s: warned %v, want %v: %q", tt.listen, got, tt.warn, logs.String())
+		if warned := strings.Contains(logs.String(), "no rate_limit"); warned != tt.warn {
+			t.Errorf("route%q auth%q: warned %v; logs %q", tt.extra, tt.auth, warned, logs.String())
 		}
 	}
 }

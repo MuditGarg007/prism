@@ -119,6 +119,32 @@ func (r *Rate) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
+// OptionalRate is a Rate that may also be written "off".
+type OptionalRate struct {
+	Rate
+	Off bool
+}
+
+// Set reports whether r was given at all, as a rate or as "off".
+func (r OptionalRate) Set() bool { return r.Off || r.Count > 0 }
+
+// MarshalText writes r as UnmarshalYAML reads it.
+func (r OptionalRate) MarshalText() ([]byte, error) {
+	if r.Off {
+		return []byte("off"), nil
+	}
+	return r.Rate.MarshalText()
+}
+
+func (r *OptionalRate) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode && strings.TrimSpace(n.Value) == "off" {
+		*r = OptionalRate{Off: true}
+		return nil
+	}
+	r.Off = false
+	return r.Rate.UnmarshalYAML(n)
+}
+
 // Prefix is an IP network written as a CIDR ("10.0.0.0/8") or a bare
 // address ("127.0.0.1"), which means a single host.
 type Prefix struct {

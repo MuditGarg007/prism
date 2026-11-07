@@ -7,11 +7,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+var client = netip.MustParseAddr("192.0.2.7")
 
 func hashOf(t testing.TB, pass string) string {
 	t.Helper()
@@ -63,7 +66,7 @@ func TestAuthenticatorCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := NewAuthenticator(tt.cfg)
-			got, err := a.Check(request(tt.hdr))
+			got, err := a.Check(request(tt.hdr), client)
 			if got != tt.want {
 				t.Errorf("Check = %q, %v; want %q", got, err, tt.want)
 			}
@@ -85,7 +88,7 @@ func TestAuthenticatorTwoKeyValues(t *testing.T) {
 	a := NewAuthenticator(AuthConfig{KeyHeader: "X-API-Key", Keys: keys})
 	r := request(nil)
 	r.Header["X-Api-Key"] = []string{"key-one", "key-one"}
-	if _, err := a.Check(r); err == nil {
+	if _, err := a.Check(r, client); err == nil {
 		t.Error("two key values were accepted")
 	}
 }
@@ -98,7 +101,7 @@ func TestAuthenticatorRemembers(t *testing.T) {
 	a := NewAuthenticator(AuthConfig{Users: map[string]string{"alice": hashOf(t, "s3cret")}})
 	a.now = func() time.Time { return now }
 	r := request(map[string]string{"Authorization": basic("alice", "s3cret")})
-	if _, err := a.Check(r); err != nil {
+	if _, err := a.Check(r, client); err != nil {
 		t.Fatal(err)
 	}
 	if len(a.verified) != 1 {
@@ -108,14 +111,14 @@ func TestAuthenticatorRemembers(t *testing.T) {
 	for range cap(a.cpu) {
 		a.cpu <- struct{}{}
 	}
-	if _, err := a.Check(r); err != nil {
+	if _, err := a.Check(r, client); err != nil {
 		t.Errorf("remembered password refused: %v", err)
 	}
 	// A wrong password for a remembered user is not a hit, and waits.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	wrong := request(map[string]string{"Authorization": basic("alice", "nope")}).WithContext(ctx)
-	if _, err := a.Check(wrong); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := a.Check(wrong, client); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("wrong password with no free slot: err = %v, want the context's", err)
 	}
 	for range cap(a.cpu) {
@@ -129,6 +132,66 @@ func TestAuthenticatorRemembers(t *testing.T) {
 	a.remember(sha256.Sum256([]byte("alice\x00s3cret")), "old-hash")
 	if a.remembered(sha256.Sum256([]byte("alice\x00s3cret")), a.cfg.Users["alice"]) {
 		t.Error("entry checked against another hash was trusted")
+	}
+}
+
+func TestAuthenticatorFailureLimit(t *testing.T) {
+	keys := map[[sha256.Size]byte]string{sha256.Sum256([]byte("key-one")): "ci"}
+	a := NewAuthenticator(AuthConfig{KeyHeader: "X-API-Key", Keys: keys, FailureCount: 3, FailurePer: time.Minute})
+	good := request(map[string]string{"X-Api-Key": "key-one"})
+	wrong := request(map[string]string{"X-Api-Key": "key-two"})
+	none := request(nil)
+
+	// Missing credentials cost nothing.
+	for range 10 {
+		if _, err := a.Check(none, client); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("no credentials: err = %v, want ErrUnauthorized", err)
+		}
+	}
+	for i := range 3 {
+		if _, err := a.Check(wrong, client); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("wrong key %d: err = %v, want ErrUnauthorized", i, err)
+		}
+	}
+	// Over the limit, even the right key is refused, without being looked at.
+	var le *LimitedError
+	if _, err := a.Check(good, client); !errors.As(err, &le) || le.RetryAfter <= 0 || le.RetryAfter > 20*time.Second {
+		t.Fatalf("good key after 3 failures: err = %v, want a LimitedError with a wait of up to 20s", err)
+	}
+	if name, err := a.Check(good, netip.MustParseAddr("192.0.2.8")); name != "ci" || err != nil {
+		t.Errorf("another client = %q, %v; want ci", name, err)
+	}
+}
+
+func TestFailureKey(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"192.0.2.7", "192.0.2.7"},
+		{"::ffff:192.0.2.7", "192.0.2.7"},
+		{"2001:db8:1:2:aaaa::1", "2001:db8:1:2::"},
+		{"2001:db8:1:2:bbbb::9", "2001:db8:1:2::"},
+		{"2001:db8:1:3::1", "2001:db8:1:3::"},
+	}
+	for _, tt := range tests {
+		if got := failureKey(netip.MustParseAddr(tt.in)); got.String() != tt.want {
+			t.Errorf("failureKey(%s) = %s, want %s", tt.in, got, tt.want)
+		}
+	}
+}
+
+// A guess that passed the first look at the limit and then waited for a
+// bcrypt slot, while the client's other guesses failed, is refused once it
+// gets the slot rather than checked.
+func TestAuthenticatorFailureLimitAfterQueue(t *testing.T) {
+	a := NewAuthenticator(AuthConfig{Users: map[string]string{"alice": hashOf(t, "s3cret")}, FailureCount: 2, FailurePer: time.Minute})
+	key := failureKey(client)
+	a.failures.Allow(key)
+	a.failures.Allow(key)
+	var le *LimitedError
+	if _, err := a.checkPassword(context.Background(), "alice", "s3cret", key); !errors.As(err, &le) {
+		t.Errorf("checkPassword over the limit: err = %v, want a LimitedError", err)
+	}
+	if len(a.verified) != 0 {
+		t.Error("the password was checked and remembered")
 	}
 }
 
@@ -186,13 +249,13 @@ func TestAuthenticatorPrepare(t *testing.T) {
 func BenchmarkAuthenticatorRemembered(b *testing.B) {
 	a := NewAuthenticator(AuthConfig{Users: map[string]string{"alice": hashOf(b, "s3cret")}})
 	r := request(map[string]string{"Authorization": basic("alice", "s3cret")})
-	if _, err := a.Check(r); err != nil {
+	if _, err := a.Check(r, client); err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if _, err := a.Check(r); err != nil {
+			if _, err := a.Check(r, client); err != nil {
 				b.Fatal(err)
 			}
 		}

@@ -102,11 +102,14 @@ func (s *Server) ReloadCerts(listeners []config.Listener) (swap func(), err erro
 
 // Admin adds a listener on addr that serves h, the admin API. It skips the
 // access log and the ready path, and shuts down with the other listeners.
-// It must be called at most once, before Start.
+// Ahead of h, and so of its auth, it answers GET /ready (200 until Drain,
+// 503 after) and GET /live (always 200), for probes that carry no
+// credentials; neither tells anything about the config. It must be called
+// at most once, before Start.
 func (s *Server) Admin(addr string, h http.Handler) {
 	s.servers = append(s.servers, &http.Server{
 		Addr:              addr,
-		Handler:           h,
+		Handler:           s.readiness("/ready", liveness("/live", h)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	})
@@ -185,6 +188,19 @@ func (s *Server) readiness(readyPath string, next http.Handler) http.Handler {
 			return
 		}
 		io.WriteString(w, "ready\n")
+	})
+}
+
+// liveness answers livePath with 200 ahead of next for as long as the
+// process serves at all, draining included.
+func liveness(livePath string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != livePath {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		io.WriteString(w, "live\n")
 	})
 }
 

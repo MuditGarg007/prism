@@ -248,3 +248,63 @@ func TestCheckerStartsFromState(t *testing.T) {
 		t.Errorf("healthy again after %d checks, want at least 3", n)
 	}
 }
+
+// TestCheckerContinuesRecord checks that a checker started after a reload
+// carries on the backend's record: it continues the streak, and checks
+// when the record says the next check is due rather than at a random
+// offset.
+func TestCheckerContinuesRecord(t *testing.T) {
+	fb := newFlipBackend(t)
+	fb.down.Store(true)
+	pool := newPool(t, fb.URL)
+	b := pool.Backends[0]
+	const interval = time.Hour
+	b.SetHealthRecord(upstream.HealthRecord{Streak: 2, Due: time.Now().Add(20 * time.Millisecond)})
+	c := New(pool, Config{Path: "/", Interval: interval, Timeout: time.Second, UnhealthyAfter: 3, HealthyAfter: 1}, slog.New(slog.DiscardHandler))
+	c.randN = func(n time.Duration) time.Duration { return n - 1 } // a random start would be an hour away
+	c.Start()
+	defer c.Stop()
+	waitFor(t, "the backend to go down", func() bool { return !b.Healthy() })
+	if n := fb.count(); n != 1 {
+		t.Errorf("down after %d checks, want 1 on top of the streak of 2", n)
+	}
+	if r := b.HealthRecord(); r.Streak != 0 || time.Until(r.Due) < interval/2 {
+		t.Errorf("record %+v, want the streak reset by the flip and the next check an interval away", r)
+	}
+}
+
+// TestCheckerReloadStorm checks that a failing backend is still marked down
+// after unhealthy_after checks when its checker is replaced, as by a
+// reload, several times per interval. With a fresh random start each time,
+// a reload storm would put the checks off indefinitely.
+func TestCheckerReloadStorm(t *testing.T) {
+	fb := newFlipBackend(t)
+	fb.down.Store(true)
+	pool := newPool(t, fb.URL)
+	b := pool.Backends[0]
+	cfg := Config{Path: "/", Interval: 20 * time.Millisecond, Timeout: time.Second, UnhealthyAfter: 3, HealthyAfter: 1}
+	newChecker := func() *Checker {
+		c := New(pool, cfg, slog.New(slog.DiscardHandler))
+		c.randN = func(n time.Duration) time.Duration { return n - 1 }
+		c.Start()
+		return c
+	}
+	cur := newChecker()
+	defer func() { cur.Stop() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for b.Healthy() {
+		if time.Now().After(deadline) {
+			t.Fatalf("still healthy after %d checks", fb.count())
+		}
+		time.Sleep(5 * time.Millisecond)
+		// The reloader's order: start the new checker, then stop the old.
+		next := newChecker()
+		cur.Stop()
+		cur = next
+	}
+	// A checker stopped mid-check discards its result, so the backend may
+	// have seen more checks than were counted, but never fewer.
+	if n := fb.count(); n < cfg.UnhealthyAfter {
+		t.Errorf("down after %d checks, want at least %d", n, cfg.UnhealthyAfter)
+	}
+}

@@ -88,11 +88,11 @@ func TestIPHashSpread(t *testing.T) {
 		weights   []int
 		tolerance float64 // allowed deviation from the expected share, relative
 	}{
-		{equal(3), 0.15},
-		{equal(5), 0.15},
-		{equal(10), 0.20},
-		{[]int{3, 1}, 0.10},
-		{[]int{4, 2, 1, 1}, 0.15},
+		{equal(3), 0.05},
+		{equal(5), 0.05},
+		{equal(10), 0.05},
+		{[]int{3, 1}, 0.05},
+		{[]int{4, 2, 1, 1}, 0.05},
 	} {
 		t.Run(fmt.Sprint(tt.weights), func(t *testing.T) {
 			bs := hosts(tt.weights...)

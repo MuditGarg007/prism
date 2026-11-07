@@ -35,9 +35,15 @@ cache: { max_size: 64MB }
 # Admin API on its own listener: GET /metrics (Prometheus), GET /routes,
 # GET /upstreams (live health, inflight and breaker state), GET /config (the
 # effective config, URL passwords masked), POST /reload, POST /cache/purge
-# and GET /cache/stats. Keep it on loopback; it has no authentication.
-# pprof: true adds Go's profiler under /debug/pprof/, for example
+# and GET /cache/stats, plus GET /ready (503 once shutdown begins) and
+# GET /live for probes. pprof: true adds Go's profiler under /debug/pprof/,
+# for example
 #   go tool pprof http://127.0.0.1:9901/debug/pprof/profile?seconds=30
+# A listen address beyond loopback needs auth, which takes the same basic
+# and api_keys blocks as a route's (and its failure_limit). Every endpoint
+# but /ready and /live then needs credentials; Prometheus can scrape with
+# api_keys: { header: Authorization, keys: { prometheus: "sha256:..." } }
+# and a bearer token.
 admin: { listen: "127.0.0.1:9901", pprof: false }
 
 # Refuses requests by client IP (after trusted_proxies) with 403, before
@@ -111,22 +117,28 @@ routes:
     # max_object passes through uncached. Requests for a key being fetched
     # wait up to lock_timeout for it, then fetch for themselves. When the
     # backend fails, an entry up to stale_if_error past its freshness is
-    # served instead (X-Cache: STALE). Requests carrying bypass_header skip
-    # the lookup, but their response is still stored.
+    # served instead (X-Cache: STALE). Within stale_while_revalidate past its
+    # freshness, an entry is served at once (X-Cache: UPDATING) while one
+    # background request revalidates it. Requests carrying bypass_header
+    # skip the lookup, but their response is still stored.
     cache:
       enabled: true
       max_object: 1MB
       lock_timeout: 5s
       stale_if_error: 30s
+      stale_while_revalidate: 10s
       bypass_header: X-Cache-Bypass
     # Requests need a user and password (Basic) or an API key; either one
     # will do. Passwords are bcrypt hashes ("htpasswd -nbB user password"),
     # keys sha256 digests ("printf %s key | sha256sum"). Failures get 401.
     # The checked credentials are removed before forwarding unless
     # forward_credentials is set, and identity_header tells the backend who
-    # was let in. Rate limits apply before auth, so they also cap password
-    # guessing. A cached response is shared between authenticated clients
-    # only when it is public, s-maxage or must-revalidate.
+    # was let in. failure_limit (default 10/m, or off) caps wrong
+    # credentials per client IP (per /64 for IPv6); a client over it gets
+    # 429 before any password is checked. Missing credentials don't count.
+    # Rate limits apply before auth too. A cached response is shared
+    # between authenticated clients only when it is public, s-maxage or
+    # must-revalidate.
     # The example user is alice with password s3cret, the key is key-one.
     auth:
       basic:
@@ -136,6 +148,7 @@ routes:
         header: X-API-Key
         keys: { ci: "sha256:9b346041bc9a49574eb2665b2ad2a0a3f9f9cce4e42f5d1f26deb8a256b5966a" }
       identity_header: X-Auth-User
+      failure_limit: 10/m
     # Sends percent of clients to api-v2, each client always to the same
     # side (hashed by IP). A header or cookie set to "always" or "never"
     # picks the side for one request. Canary responses are never cached.

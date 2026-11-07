@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"slices"
@@ -58,6 +59,19 @@ func (c *Config) validateLifecycle(p *problems) {
 	if a := c.Admin; a != nil {
 		if err := checkAddr(a.Listen); err != nil {
 			p.add("admin.listen", "%v", err)
+		} else if a.Auth == nil && !loopback(a.Listen) {
+			// /config, /reload, /cache/purge and pprof are not for the
+			// network to use.
+			p.add("admin.listen", "%q is not a loopback address: set admin.auth, or listen on 127.0.0.1, [::1] or localhost", a.Listen)
+		}
+		if au := a.Auth; au != nil {
+			validateAuth(p, "admin.auth", au)
+			if au.ForwardCredentials {
+				p.add("admin.auth.forward_credentials", "has no effect on the admin API")
+			}
+			if au.IdentityHeader != "" {
+				p.add("admin.auth.identity_header", "has no effect on the admin API")
+			}
 		}
 		for i, l := range c.Listeners {
 			if l.Addr == a.Listen {
@@ -65,6 +79,20 @@ func (c *Config) validateLifecycle(p *problems) {
 			}
 		}
 	}
+}
+
+// loopback reports whether addr only accepts connections from this host.
+// An empty host listens on every interface.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }
 
 // checkAddr checks a listen address of the form "host:port", where the host
@@ -427,6 +455,9 @@ func validateCache(p *problems, path string, ca *Cache, maxSize ByteSize) {
 	}
 	if ca.StaleIfError < 0 {
 		p.add(path+".stale_if_error", "must not be negative, got %v", ca.StaleIfError)
+	}
+	if ca.StaleWhileRevalidate < 0 {
+		p.add(path+".stale_while_revalidate", "must not be negative, got %v", ca.StaleWhileRevalidate)
 	}
 }
 

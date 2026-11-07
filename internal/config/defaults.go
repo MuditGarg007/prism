@@ -36,6 +36,7 @@ const (
 	defaultCacheLockTimeout      = 5 * time.Second
 	defaultRealm                 = "prism"
 	defaultAPIKeyHeader          = "X-API-Key"
+	defaultAuthFailures          = 10 // per minute
 	defaultShadowPercent         = 100
 	defaultShadowMaxBody         = 64 << 10
 	defaultShadowConcurrency     = 16
@@ -85,6 +86,9 @@ func (c *Config) applyDefaults() {
 			setDefault(&o.MaxEjectionPercent, defaultMaxEjectionPercent)
 		}
 	}
+	if a := c.Admin; a != nil && a.Auth != nil {
+		defaultAuth(a.Auth)
+	}
 	for i := range c.Routes {
 		r := &c.Routes[i]
 		r.Match.Host = strings.ToLower(r.Match.Host)
@@ -109,12 +113,7 @@ func (c *Config) applyDefaults() {
 			setDefault(&ca.LockTimeout, defaultCacheLockTimeout)
 		}
 		if a := r.Auth; a != nil {
-			if b := a.Basic; b != nil {
-				setDefault(&b.Realm, defaultRealm)
-			}
-			if k := a.APIKeys; k != nil {
-				setDefault(&k.Header, defaultAPIKeyHeader)
-			}
+			defaultAuth(a)
 		}
 		if sh := r.Shadow; sh != nil {
 			setDefault(&sh.Percent, defaultShadowPercent)
@@ -125,6 +124,18 @@ func (c *Config) applyDefaults() {
 		if ws := r.WebSocket; ws != nil {
 			setDefault(&ws.IdleTimeout, defaultWebSocketIdleTimeout)
 		}
+	}
+}
+
+func defaultAuth(a *Auth) {
+	if b := a.Basic; b != nil {
+		setDefault(&b.Realm, defaultRealm)
+	}
+	if k := a.APIKeys; k != nil {
+		setDefault(&k.Header, defaultAPIKeyHeader)
+	}
+	if !a.FailureLimit.Set() {
+		a.FailureLimit.Rate = Rate{Count: defaultAuthFailures, Per: time.Minute}
 	}
 }
 

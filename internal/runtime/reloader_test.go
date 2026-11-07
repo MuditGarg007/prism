@@ -268,3 +268,21 @@ func TestReloaderConcurrent(t *testing.T) {
 		t.Errorf("%v reloads counted, want 8", n)
 	}
 }
+
+// TestReloaderAdminAuth checks that an admin block with auth, which holds
+// pointers, counts as unchanged when the file says the same thing.
+func TestReloaderAdminAuth(t *testing.T) {
+	a := namedBackend(t, "a")
+	top := `
+listeners: [{ addr: ":8080" }]
+admin: { listen: "0.0.0.0:9901", auth: { basic: { users: { ops: "` + testHash + `" } } } }
+`
+	f := newReloadFixture(t, reloadConfig(top, a.URL))
+	f.write(reloadConfig(top, a.URL))
+	if err := f.r.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.logs.String(), "setting=admin") {
+		t.Errorf("unchanged admin auth was reported as changed: %s", f.logs.String())
+	}
+}

@@ -7,8 +7,8 @@ Prism is an nginx-style HTTP reverse proxy written in Go. It uses `net/http` for
 - **Core proxy:** host and longest-prefix routing, TLS with SNI certificate selection, prefix stripping, request and response header rules, X-Forwarded-* and RFC 7239 `Forwarded` with a trusted-proxy list, streaming in both directions with flushing and trailers, client cancellation passed through to the backend, and graceful shutdown with a drain delay.
 - **Traffic management:** round robin, smooth weighted round robin, least connections (power of two choices) and consistent-hash `ip_hash`; per-IP GCRA rate limits; per-route concurrency caps with a bounded queue; request body limits; retries that only go to an untried backend.
 - **Resilience:** a circuit breaker per backend, outlier ejection, active health checks, and a per-route retry budget with full-jitter backoff.
-- **Caching:** an RFC 9111 response cache with a hand-written `Cache-Control` parser, Vary, revalidation with ETag and Last-Modified, `stale-if-error`, request coalescing with a lock timeout and hit-for-pass, and purging through the admin API.
-- **Operations:** Prometheus metrics, JSON or text access logs, `X-Request-Id`, and an admin API (`/routes`, `/upstreams`, `/config`, `/metrics`, `/reload`, `/cache/stats`, `/cache/purge`, and optionally `/debug/pprof/`). SIGHUP reloads the config without dropping a request, and it keeps health, breakers, pooled connections, limiters and the cache when their settings are unchanged.
+- **Caching:** an RFC 9111 response cache with a hand-written `Cache-Control` parser, Vary, revalidation with ETag and Last-Modified, `stale-if-error` and `stale-while-revalidate`, request coalescing with a lock timeout and hit-for-pass, and purging through the admin API.
+- **Operations:** Prometheus metrics, JSON or text access logs, `X-Request-Id`, and an admin API (`/routes`, `/upstreams`, `/config`, `/metrics`, `/reload`, `/cache/stats`, `/cache/purge`, and optionally `/debug/pprof/`) with optional Basic or bearer-key auth and its own `/ready` and `/live` probes. SIGHUP reloads the config without dropping a request, and it keeps health, breakers, pooled connections, limiters and the cache when their settings are unchanged.
 - **Routing and security:** IP allow and deny lists, Basic auth with bcrypt and API keys, sticky canary splits, shadow traffic, WebSockets, HTTP/2 on TLS and h2c, and W3C `traceparent` propagation.
 
 ## Quickstart
@@ -22,7 +22,7 @@ make build                                        # bin/prism
 kill -HUP $(pgrep prism)                          # reload the config
 ```
 
-The flags are `-config` (default `prism.yaml`), `-validate`, `-log-level` (`debug`, `info`, `warn` or `error`), `-log-format` (`text` or `json`) and `-version`.
+The flags are `-config` (default `prism.yaml`), `-validate`, `-log-level` (`debug`, `info`, `warn` or `error`), `-log-format` (`text` or `json`), `-log-buffer` and `-version`. Logs go to stderr one line at a time. `-log-buffer 64KB` buffers them instead, in two buffers of that size, and flushes every second, when a buffer is full and at exit, so a crash can lose up to a second of lines. A full buffer is written out while the other one fills, so a slow disk doesn't hold up requests. Buffering saves a write syscall per request; in the benchmarks it did not shorten the latency tail.
 
 [`examples/prism.yaml`](examples/prism.yaml) uses every feature and explains each setting in its comments. A minimal config:
 
@@ -139,7 +139,7 @@ flowchart LR
 
 ## Design decisions and tradeoffs
 
-The full reasoning is in the handoff notes, [`docs/m1-handoff.md`](docs/m1-handoff.md) through [`docs/m7-handoff.md`](docs/m7-handoff.md).
+The full reasoning is in the handoff notes, [`docs/m1-handoff.md`](docs/m1-handoff.md) through [`docs/m8-handoff.md`](docs/m8-handoff.md).
 
 **Forwarding**
 
@@ -152,8 +152,8 @@ The full reasoning is in the handoff notes, [`docs/m1-handoff.md`](docs/m1-hando
 **Traffic and resilience**
 
 - **Least connections uses power of two choices** on `(inflight+1)/weight`. It is O(1), and it doesn't send every concurrent request to the same idle backend, as Envoy's least_request also avoids.
-- **`ip_hash` is a ketama-style ring with unseeded hashes.** Adding a backend moves about 1/N of clients, and all instances agree. With 160 points per weight, spread across 10 backends is about ±17%.
-- **The rate limit is GCRA**: one integer per key, an exact token bucket, in 64 sharded maps with lazy eviction and no background goroutine.
+- **`ip_hash` is a ketama-style ring with unseeded hashes.** Adding a backend moves about 1/N of clients, and all instances agree. With 4,096 points per weight, 10 equal backends are within ±5% of an even split, at a cost of about 12 ns per lookup over Ketama's 160 points (which left them ±17% apart). Upgrading to M8 from an earlier version therefore remaps most `ip_hash` clients, once.
+- **The rate limit is GCRA**: one integer per key, an exact token bucket, in 64 sharded maps with lazy eviction and no background goroutine. Each limiter holds at most about 262,000 keys, which is what bounds its memory under a flood of addresses. Past that it forgets a live client, giving it a fresh burst, and `prism_ratelimit_evictions_total{route,limit}` counts each one, for route rate limits and failed-auth limits alike.
 - **Retries go only to an untried backend.** `connect_error` is retried for any method, but only when no body bytes were sent; timeouts and 5xx only for idempotent methods. A retry never duplicates a non-idempotent request.
 - **A Finagle-style retry budget per route.** Retries are capped at a ratio of requests over a 10 s window, so an outage can't multiply load. Once the budget is spent, retries come back in a burst every 10 s; a token bucket would smooth that, but it would lose the exact per-window bound.
 - **One breaker per backend**, so one bad backend doesn't open the breaker for the whole pool. A client cancel, a 4xx or a local rejection never counts as a failure, so a client can't get healthy backends ejected.
@@ -162,19 +162,21 @@ The full reasoning is in the handoff notes, [`docs/m1-handoff.md`](docs/m1-hando
 **Caching**
 
 - **No heuristic freshness.** A response without `s-maxage`, `max-age` or `Expires` is not cached, because guessing a lifetime is how stale pages get served.
-- **Coalescing follows nginx's `proxy_cache_lock` and Varnish's hit-for-pass.** One leader fetches while the others wait up to `lock_timeout`; an uncacheable answer marks the key for 10 s so later requests don't queue behind it. The leader keeps filling the cache after its own client leaves, because the waiters depend on it.
+- **Coalescing follows nginx's `proxy_cache_lock` and Varnish's hit-for-pass.** One leader fetches while the others wait up to `lock_timeout`; an uncacheable answer marks the key for 10 s so later requests don't queue behind it. The leader keeps filling the cache after its own client leaves, because the waiters depend on it, but for `lock_timeout` at most: a backend that stalls mid-body then loses the fill rather than holding a goroutine and a concurrency slot for good.
+- **`stale-while-revalidate` never queues.** Within the route's window (which a response's own directive can narrow, never widen), a stale entry is served at once as `UPDATING`, and the one request that leads the key's flight revalidates it in the background. That fetch takes a concurrency slot only if one is free, and reads the body for `lock_timeout` at most; if it fails, the entry stays and a later request tries again.
 - **One mutex over a byte-bounded LRU of immutable entries.** Hits write to the client without holding the lock.
 - **Authenticated responses are shared only when they are `public`, `s-maxage` or `must-revalidate`**, for both `Authorization` and Prism's own auth.
 
 **Operations**
 
 - **Metric handles are resolved per route and backend when the config is built**, and the `code` label is the status class. Recording a request indexes an array instead of hashing labels behind a lock. The access log keeps the exact status.
-- **A reload keeps state by identity.** A backend's health, inflight count, breaker and transport, a route's limiter, semaphore and retry budget, and the cache each carry over while their settings are unchanged. Listener, admin and shutdown settings need a restart, and a reload warns about changes to them.
+- **A reload keeps state by identity.** A backend's health (with its check streak and schedule, so a reload storm can't put checks off), inflight count, breaker and transport, a route's limiter, semaphore and retry budget, and the cache each carry over while their settings are unchanged. Listener, admin and shutdown settings need a restart, and a reload warns about changes to them.
+- **The admin API is on loopback or behind auth.** `admin.auth` takes the same `basic` and `api_keys` blocks as a route, with the same failure limit, and a non-loopback `admin.listen` without it fails validation, since `/config`, `/reload`, `/cache/purge` and pprof are not for the network. Prometheus scrapes with a bearer key (`api_keys: { header: Authorization }`). `/ready` (503 once shutdown begins) and `/live` are answered ahead of auth, because probes carry no credentials and the answers reveal nothing.
 - **`X-Request-Id` is trusted only from trusted peers**, so a client can't choose the ID its requests are logged under. `traceparent` is accepted from anyone, because it decides nothing inside Prism and joining a browser's trace is the point.
 
 **Routing and security**
 
-- **The rate limit runs before auth**, so it also caps password guessing. bcrypt runs at most GOMAXPROCS at a time, unknown users are checked against a dummy hash, and verified passwords are remembered for five minutes.
+- **Wrong credentials are limited per client.** `auth.failure_limit` (default `10/m`, with a burst of 10) counts wrong passwords and keys per client IP, and per /64 for IPv6, so rotating addresses in one allocation doesn't reset it. Missing credentials don't count, since a browser's first request carries none. A client over the limit gets 429 with `Retry-After` before any bcrypt work, and the limit is checked again once a queued guess gets a bcrypt slot. bcrypt runs at most GOMAXPROCS at a time, unknown users are checked against a dummy hash, and verified passwords are remembered for five minutes. The route's rate limit, if set, runs before auth as well.
 - **Canary assignment is sticky by client IP over 10,000 buckets.** Raising the percent only adds clients, and a header or cookie set to `always` or `never` overrides it for one request. Canary requests skip the cache.
 - **Shadow copies never delay the real request.** A copy runs on its own goroutine with its own timeout, a full semaphore drops it, and a body that is too large or of unknown length is not copied.
 - **A WebSocket holds its route's concurrency slot for its whole life**, so the cap bounds open connections too.
@@ -252,17 +254,15 @@ To reproduce, run `make bench-compare` (`QUICK=1` for a one-minute trial). It ne
 ## What's not supported
 
 - **HTTP/2 or HTTP/3 to backends.** Backends are reached over HTTP/1.1. HTTP/3 isn't supported on either side.
-- **WebSockets over HTTP/2** (RFC 8441, extended CONNECT). Only HTTP/1.1 clients can upgrade. Prism sends no close frame at shutdown; it closes the TCP connection at the deadline.
-- **`stale-while-revalidate`** is parsed but not acted on. There is no heuristic freshness, no disk cache, and HEAD misses are not cached.
-- **Admin authentication.** The admin API has none, and Prism warns at startup when it listens beyond loopback. `/config` hides hashes, key digests and URL passwords, but it shows user and key names.
-- **A separate limiter for failed logins.** Password guessing is limited only by the route's rate limit; Build warns about a Basic auth route without one.
-- **ACME, adaptive concurrency limits, OpenTelemetry export and readiness on the admin port.** Readiness is a `ready_path` on the main listeners.
-- **Known limits:**
-  - After its client leaves, the cache leader's drain of the backend body has no deadline.
-  - Health check streaks restart on every reload.
-  - The rate limiter holds at most about 262,000 keys per route.
-  - `ip_hash` spread is about ±17% across 10 backends.
+- **WebSockets over HTTP/2** (RFC 8441, extended CONNECT). Only HTTP/1.1 clients can upgrade.
+- **A WebSocket close frame at shutdown.** Prism doesn't parse frames, so at the shutdown deadline it closes the TCP connection without sending 1001 "going away".
+- **One span per attempt.** There is one span per incoming request, and every request Prism sends for it names that span as the parent.
+- **Shadowing a body the backend hasn't finished reading.** When the real backend answers before reading the whole body, no copy is sent and it counts as `body_skipped`, because waiting would delay the response.
+- **A per-route canary split.** The canary hash ignores the route on purpose, so a client sees one version across routes.
+- **One reload per SIGHUP.** Signals sent during a reload are coalesced into one more reload, which reads the latest file anyway.
+- **Heuristic freshness, a disk cache, and caching HEAD misses.**
+- **ACME, adaptive concurrency limits and OpenTelemetry export.**
 
 ## Project history
 
-Prism was built in eight milestones, from a skeleton to these benchmarks. The plan and its status are in [`docs/project-plan.md`](docs/project-plan.md), and each milestone's decisions are in its handoff note in [`docs/`](docs/).
+Prism was built in nine milestones, from a skeleton to these benchmarks and a final round of hardening. The plan and its status are in [`docs/project-plan.md`](docs/project-plan.md), and each milestone's decisions are in its handoff note in [`docs/`](docs/).

@@ -360,6 +360,8 @@ func TestPoolCarryOver(t *testing.T) {
 			adm, _ := pa.Admit()
 			pa.Report(adm, resilience.Failure) // opens with min_requests 1
 			pb.SetHealthy(false)
+			rec := HealthRecord{Streak: 1, Due: time.Now()}
+			pb.SetHealthRecord(rec)
 
 			u := base()
 			tt.change(u)
@@ -400,6 +402,11 @@ func TestPoolCarryOver(t *testing.T) {
 			}
 			if got := !nb.Healthy(); got != tt.unhealthy {
 				t.Errorf("b unhealthy = %v, want %v", got, tt.unhealthy)
+			}
+			// The health record goes with the health state, and is cleared
+			// with it.
+			if got := nb.HealthRecord() == rec; got != tt.unhealthy {
+				t.Errorf("b's health record %+v kept = %v, want %v", nb.HealthRecord(), got, tt.unhealthy)
 			}
 			for i, b := range p.Backends {
 				if b.index != i || b.outlier != p.outlier {

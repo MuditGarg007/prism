@@ -403,8 +403,9 @@ func TestServerShutdownHijacked(t *testing.T) {
 	})
 }
 
-// TestServerAdmin checks that the admin listener serves its own handler,
-// skips the ready path and the access log, and shuts down with the rest.
+// TestServerAdmin checks that the admin listener serves its own handler
+// behind its own /ready and /live, skips the access log, and shuts down
+// with the rest.
 func TestServerAdmin(t *testing.T) {
 	logs, log := newTestLogger()
 	s, err := New([]config.Listener{plainListener()}, "/ready", http.NotFoundHandler(), log)
@@ -427,16 +428,34 @@ func TestServerAdmin(t *testing.T) {
 		t.Errorf("AdminAddr %v is not the last address %v", s.AdminAddr(), s.Addrs()[1])
 	}
 	base := "http://" + s.AdminAddr().String()
-	for _, path := range []string{"/cache/stats", "/ready"} {
+	get := func(path string) (int, string) {
+		t.Helper()
 		resp, err := http.Get(base + path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if string(body) != "admin "+path {
-			t.Errorf("%s: %q", path, body)
+		return resp.StatusCode, string(body)
+	}
+	// The probes are answered ahead of the admin handler, and so of its
+	// auth; anything else reaches it.
+	for path, want := range map[string]string{
+		"/cache/stats": "admin /cache/stats",
+		"/ready/x":     "admin /ready/x",
+		"/ready":       "ready\n",
+		"/live":        "live\n",
+	} {
+		if code, body := get(path); code != http.StatusOK || body != want {
+			t.Errorf("%s: %d %q, want 200 %q", path, code, body, want)
 		}
+	}
+	s.Drain()
+	if code, _ := get("/ready"); code != http.StatusServiceUnavailable {
+		t.Errorf("/ready while draining: %d, want 503", code)
+	}
+	if code, _ := get("/live"); code != http.StatusOK {
+		t.Errorf("/live while draining: %d, want 200", code)
 	}
 	if out := logs.waitFor(t, "admin API listening"); !strings.Contains(out, "admin API listening") || strings.Contains(out, "/cache/stats") {
 		t.Errorf("logs: %q", out)

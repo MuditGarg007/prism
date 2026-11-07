@@ -35,8 +35,10 @@ type Checker struct {
 	pool *upstream.Pool
 	log  *slog.Logger
 
-	// randN returns a random duration in [0, n). Tests replace it.
+	// randN returns a random duration in [0, n). Tests replace it, and
+	// now, which dates each check for the backend's record.
 	randN func(n time.Duration) time.Duration
+	now   func() time.Time
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -49,6 +51,7 @@ func New(pool *upstream.Pool, cfg Config, log *slog.Logger) *Checker {
 		pool:  pool,
 		log:   log.With("upstream", pool.Name),
 		randN: rand.N[time.Duration],
+		now:   time.Now,
 	}
 }
 
@@ -72,18 +75,31 @@ func (c *Checker) Stop() {
 
 func (c *Checker) run(ctx context.Context, b *upstream.Backend) {
 	log := c.log.With("backend", b.String())
-	// Start from the backend's current state, which a reload carries over,
-	// so a backend that was down needs healthy_after passes to come back.
-	t := tracker{unhealthyAfter: c.cfg.UnhealthyAfter, healthyAfter: c.cfg.HealthyAfter, unhealthy: !b.Healthy()}
-	// A random first offset spreads the checks of many backends, and of
-	// many proxies started together, over the interval.
-	timer := time.NewTimer(c.randN(c.cfg.Interval))
+	// A reload carries over the backend's record, so the checks keep the
+	// schedule they had, and a reload storm cannot keep putting them off.
+	// The first checker picks a random first offset, which spreads the
+	// checks of many backends, and of many proxies started together, over
+	// the interval.
+	rec := b.HealthRecord()
+	if rec.Due.IsZero() {
+		rec.Due = c.now().Add(c.randN(c.cfg.Interval))
+		b.SetHealthRecord(rec)
+	}
+	due := rec.Due
+	timer := time.NewTimer(c.until(due))
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		}
+		if d := b.HealthRecord().Due; !d.Equal(due) {
+			// The checker this one replaced checked meanwhile, in the
+			// moment both ran.
+			due = d
+			timer.Reset(c.until(due))
+			continue
 		}
 		err := c.check(ctx, b)
 		if ctx.Err() != nil {
@@ -92,16 +108,44 @@ func (c *Checker) run(ctx context.Context, b *upstream.Backend) {
 		if err != nil {
 			log.Debug("health check failed", "error", err)
 		}
-		if t.observe(err == nil) {
-			b.SetHealthy(!t.unhealthy)
-			if t.unhealthy {
+		var flipped bool
+		due, flipped = c.record(b, err == nil)
+		if flipped {
+			// Logged first, so whoever sees the change can find out why.
+			healthy := !b.Healthy()
+			if !healthy {
 				log.Warn("backend marked unhealthy", "checks", c.cfg.UnhealthyAfter, "error", err)
 			} else {
 				log.Info("backend marked healthy", "checks", c.cfg.HealthyAfter)
 			}
+			b.SetHealthy(healthy)
 		}
-		timer.Reset(c.next())
+		timer.Reset(c.until(due))
 	}
+}
+
+// until returns the wait until due, at most one interval, in case the
+// interval was shortened by the reload that carried due over.
+func (c *Checker) until(due time.Time) time.Duration {
+	return min(due.Sub(c.now()), c.cfg.Interval)
+}
+
+// record adds a check result to b's record, starting from what it and b's
+// health hold, so a backend that was down when a reload replaced its
+// checker still needs healthy_after passes to come back. It schedules the
+// next check, and returns when that is due and whether b's health must
+// flip, which is the caller's to do.
+func (c *Checker) record(b *upstream.Backend, ok bool) (time.Time, bool) {
+	t := tracker{
+		unhealthyAfter: c.cfg.UnhealthyAfter,
+		healthyAfter:   c.cfg.HealthyAfter,
+		unhealthy:      !b.Healthy(),
+		streak:         b.HealthRecord().Streak,
+	}
+	flipped := t.observe(ok)
+	due := c.now().Add(c.next())
+	b.SetHealthRecord(upstream.HealthRecord{Streak: t.streak, Due: due})
+	return due, flipped
 }
 
 // next returns the wait before the next check: the interval ±10%, so checks

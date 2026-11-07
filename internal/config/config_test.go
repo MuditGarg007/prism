@@ -197,9 +197,15 @@ func TestParseErrors(t *testing.T) {
 		{"bad bypass header", `upstream: web }`, `upstream: web, cache: { enabled: true, bypass_header: "X Bypass" } }`, `cache.bypass_header: invalid header name "X Bypass"`},
 		{"hop-by-hop bypass header", `upstream: web }`, `upstream: web, cache: { enabled: true, bypass_header: TE } }`, `cache.bypass_header: "TE" is a hop-by-hop header`},
 		{"negative stale if error", `upstream: web }`, `upstream: web, cache: { enabled: true, stale_if_error: -1s } }`, "cache.stale_if_error: must not be negative"},
+		{"negative stale while revalidate", `upstream: web }`, `upstream: web, cache: { enabled: true, stale_while_revalidate: -1s } }`, "cache.stale_while_revalidate: must not be negative"},
 		{"admin without port", "listeners:", "admin: { listen: localhost }\nlisteners:", "admin.listen: invalid address"},
 		{"admin missing listen", "listeners:", "admin: {}\nlisteners:", "admin.listen: is required"},
 		{"admin on listener address", "listeners:", "admin: { listen: \":8080\" }\nlisteners:", "admin.listen: same address as listeners[0]"},
+		{"admin beyond loopback", "listeners:", "admin: { listen: \"0.0.0.0:9901\" }\nlisteners:", `admin.listen: "0.0.0.0:9901" is not a loopback address: set admin.auth`},
+		{"admin on every interface", "listeners:", "admin: { listen: \":9901\" }\nlisteners:", "is not a loopback address"},
+		{"admin empty auth", "listeners:", "admin: { listen: \":9901\", auth: {} }\nlisteners:", "admin.auth: set basic, api_keys or both"},
+		{"admin forwards credentials", "listeners:", "admin: { listen: \":9901\", auth: { api_keys: { keys: { a: \"" + testDigest + "\" } }, forward_credentials: true } }\nlisteners:", "admin.auth.forward_credentials: has no effect on the admin API"},
+		{"admin identity header", "listeners:", "admin: { listen: \":9901\", auth: { api_keys: { keys: { a: \"" + testDigest + "\" } }, identity_header: X-User } }\nlisteners:", "admin.auth.identity_header: has no effect"},
 		{"negative max idle conns", "    backends:", "    max_idle_conns_per_host: -1\n    backends:", "upstreams.web.max_idle_conns_per_host: must be at least 1"},
 	}
 	for _, tt := range tests {
@@ -403,6 +409,9 @@ func TestParseSecurityAndSplits(t *testing.T) {
 	if r.Auth.Basic.Realm != defaultRealm || r.Auth.APIKeys.Header != defaultAPIKeyHeader {
 		t.Errorf("auth defaults: realm %q, header %q", r.Auth.Basic.Realm, r.Auth.APIKeys.Header)
 	}
+	if got, want := r.Auth.FailureLimit, (OptionalRate{Rate: Rate{Count: defaultAuthFailures, Per: time.Minute}}); got != want {
+		t.Errorf("auth.failure_limit = %+v, want %+v", got, want)
+	}
 	if r.Canary.Percent != 2.5 {
 		t.Errorf("canary.percent = %v, want 2.5", r.Canary.Percent)
 	}
@@ -435,6 +444,7 @@ func TestParseSecurityAndSplitErrors(t *testing.T) {
 		{"hop-by-hop key header", `upstream: web, auth: { api_keys: { header: Connection, keys: { a: "` + testDigest + `" } } } }`, `auth.api_keys.header: "Connection" is a hop-by-hop header`},
 		{"identity is credentials", `upstream: web, auth: { api_keys: { keys: { a: "` + testDigest + `" } }, identity_header: x-api-key } }`, `auth.identity_header: "x-api-key" carries credentials`},
 		{"identity is authorization", `upstream: web, auth: { basic: { users: { alice: "` + testHash + `" } }, identity_header: Authorization } }`, "carries credentials"},
+		{"bad failure limit", `upstream: web, auth: { basic: { users: { alice: "` + testHash + `" } }, failure_limit: never } }`, `invalid rate "never"`},
 		{"identity is host", `upstream: web, auth: { basic: { users: { alice: "` + testHash + `" } }, identity_header: Host } }`, "auth.identity_header: cannot be Host"},
 		{"canary without upstream", `upstream: web, canary: { percent: 5 } }`, "canary.upstream: is required"},
 		{"canary unknown upstream", `upstream: web, canary: { upstream: v3 } }`, `canary.upstream: unknown upstream "v3"`},
@@ -486,5 +496,61 @@ func TestParseListenersPortZero(t *testing.T) {
 	}
 	if len(cfg.Listeners) != 2 || !cfg.Listeners[1].H2C {
 		t.Errorf("listeners = %+v", cfg.Listeners)
+	}
+}
+
+func TestParseAuthFailureLimit(t *testing.T) {
+	tests := []struct {
+		in   string
+		want OptionalRate
+		text string
+	}{
+		{"", OptionalRate{Rate: Rate{Count: defaultAuthFailures, Per: time.Minute}}, "10/m"},
+		{"failure_limit: off", OptionalRate{Off: true}, "off"},
+		{"failure_limit: 3/s", OptionalRate{Rate: Rate{Count: 3, Per: time.Second}}, "3/s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.text, func(t *testing.T) {
+			auth := `auth: { api_keys: { keys: { ci: "` + testDigest + `" } } }`
+			if tt.in != "" {
+				auth = `auth: { api_keys: { keys: { ci: "` + testDigest + `" } }, ` + tt.in + ` }`
+			}
+			cfg, err := Parse([]byte(strings.Replace(twoUpstreams, `upstream: web }`, `upstream: web, `+auth+` }`, 1)), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.Routes[0].Auth.FailureLimit
+			if got != tt.want {
+				t.Errorf("failure_limit = %+v, want %+v", got, tt.want)
+			}
+			if text, _ := got.MarshalText(); string(text) != tt.text {
+				t.Errorf("MarshalText = %q, want %q", text, tt.text)
+			}
+		})
+	}
+}
+
+func TestAdminListen(t *testing.T) {
+	tests := []struct {
+		admin string
+		ok    bool
+	}{
+		{`{ listen: "127.0.0.1:9901" }`, true},
+		{`{ listen: "127.0.0.2:9901" }`, true},
+		{`{ listen: "[::1]:9901" }`, true},
+		{`{ listen: "localhost:9901" }`, true},
+		{`{ listen: "10.0.0.1:9901" }`, false},
+		{`{ listen: "[::]:9901" }`, false},
+		{`{ listen: "0.0.0.0:9901", auth: { api_keys: { keys: { prom: "` + testDigest + `" } } } }`, true},
+	}
+	for _, tt := range tests {
+		cfg, err := Parse([]byte("admin: "+tt.admin+"\n"+minimal), "")
+		if (err == nil) != tt.ok {
+			t.Errorf("admin: %s: err = %v, want ok=%v", tt.admin, err, tt.ok)
+			continue
+		}
+		if err == nil && cfg.Admin.Auth != nil && cfg.Admin.Auth.APIKeys.Header != defaultAPIKeyHeader {
+			t.Errorf("admin auth defaults not applied: %+v", cfg.Admin.Auth.APIKeys)
+		}
 	}
 }

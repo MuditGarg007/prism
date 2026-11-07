@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,6 +22,7 @@ const (
 	cacheStale       = "STALE"
 	cacheRevalidated = "REVALIDATED"
 	cacheBypass      = "BYPASS"
+	cacheUpdating    = "UPDATING"
 )
 
 // Cache is a route's response caching. Store, Flight and Stats are shared
@@ -29,11 +31,14 @@ type Cache struct {
 	Store        *cache.Store
 	Flight       *cache.Flight
 	Stats        *cache.Stats
-	MaxObject    int64            // larger responses are passed through unstored
-	LockTimeout  time.Duration    // the longest wait for another request's fetch
-	BypassHeader string           // canonical name of a header that skips the lookup; "" for none
-	StaleIfError time.Duration    // the longest an entry is served stale when the backend fails
-	Now          func() time.Time // nil for time.Now; tests set a fake clock
+	MaxObject    int64         // larger responses are passed through unstored
+	LockTimeout  time.Duration // the longest wait for another request's fetch
+	BypassHeader string        // canonical name of a header that skips the lookup; "" for none
+	StaleIfError time.Duration // the longest an entry is served stale when the backend fails
+	// StaleWhileRevalidate is the longest an entry is served stale while a
+	// background request revalidates it.
+	StaleWhileRevalidate time.Duration
+	Now                  func() time.Time // nil for time.Now; tests set a fake clock
 }
 
 func (c *Cache) now() time.Time {
@@ -59,6 +64,8 @@ func (c *Cache) count(label string) {
 		s.Revalidated.Add(1)
 	case cacheBypass:
 		s.Bypass.Add(1)
+	case cacheUpdating:
+		s.Updating.Add(1)
 	}
 }
 
@@ -68,15 +75,27 @@ func (c *Cache) count(label string) {
 // must-revalidate and no-cache forbid serving stale, and so does s-maxage,
 // which implies proxy-revalidate (RFC 9111 §5.2.2.10).
 func (c *Cache) staleOK(e *cache.Entry, now time.Time) bool {
+	return staleWithin(e, now, c.StaleIfError, e.CC.StaleIfError)
+}
+
+// updateOK reports whether e, which is stale, may be served while a
+// background request revalidates it (stale-while-revalidate, RFC 5861),
+// under the same rules as staleOK.
+func (c *Cache) updateOK(e *cache.Entry, now time.Time) bool {
+	return staleWithin(e, now, c.StaleWhileRevalidate, e.CC.StaleWhileRevalidate)
+}
+
+// staleWithin reports whether e is at most window past its freshness, or
+// directive if that is set and shorter, and allows being served stale.
+func staleWithin(e *cache.Entry, now time.Time, window, directive time.Duration) bool {
 	cc := e.CC
-	if c.StaleIfError <= 0 || cc.MustRevalidate || cc.NoCache || cc.SMaxAge != cache.Absent {
+	if window <= 0 || cc.MustRevalidate || cc.NoCache || cc.SMaxAge != cache.Absent {
 		return false
 	}
-	limit := c.StaleIfError
-	if cc.StaleIfError != cache.Absent {
-		limit = min(limit, cc.StaleIfError)
+	if directive != cache.Absent {
+		window = min(window, directive)
 	}
-	return e.Freshness.Staleness(now) <= limit
+	return e.Freshness.Staleness(now) <= window
 }
 
 // cacheable reports whether r may use the cache. Besides what
@@ -99,7 +118,9 @@ func cacheable(r *http.Request) bool {
 
 // serveCache answers r from the cache, or fetches it and stores the
 // response. Concurrent misses for one key are coalesced: one request leads
-// and fetches, and the rest wait for it and then look again.
+// and fetches, and the rest wait for it and then look again. Within
+// stale-while-revalidate nobody waits: the stale entry is served, and the
+// leader revalidates it in the background.
 func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, rt *Route, c *Cache, an *Annotations) {
 	primary := cache.PrimaryKey(r)
 	if c.BypassHeader != "" {
@@ -128,13 +149,24 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, rt *Route, 
 			h.fill(w, r, rt, c, an, fillOpts{primary: primary, label: cacheMiss})
 			return
 		}
+		update := e != nil && c.updateOK(e, now)
 		call, role := c.Flight.Join(key)
 		switch role {
 		case cache.Lead:
+			if update {
+				h.revalidateLater(r, rt, c, an, primary, e, call)
+				h.serveEntry(w, r, rt, c, an, e, now, cacheUpdating)
+				return
+			}
 			h.fill(w, r, rt, c, an, fillOpts{primary: primary, stale: e, call: call, store: true, label: cacheMiss})
 			return
 		case cache.Pass:
 			h.fill(w, r, rt, c, an, fillOpts{primary: primary, stale: e, store: true, label: cacheMiss})
+			return
+		}
+		if update {
+			// Another request is already revalidating it.
+			h.serveEntry(w, r, rt, c, an, e, now, cacheUpdating)
 			return
 		}
 		if waitedSince.IsZero() {
@@ -170,7 +202,44 @@ type fillOpts struct {
 	call    *cache.Call  // set when leading a Flight
 	store   bool         // store the response if it may be
 	label   string       // X-Cache for a response from the backend
+	// background is set for a stale-while-revalidate fetch, which no
+	// client is waiting for. It takes a concurrency slot only if one is
+	// free, and never serves the stale entry.
+	background bool
 }
+
+// revalidateLater revalidates e in the background, leading call, for r,
+// which is answered with e at once. The fetch outlives r, so it gets its
+// own copies of r and an, and it records no stats or access log entry of
+// its own: the client's request was a cache answer. Nor is it shadowed,
+// since it is not client traffic.
+func (h *Handler) revalidateLater(r *http.Request, rt *Route, c *Cache, an *Annotations, primary string, e *cache.Entry, call *cache.Call) {
+	br := r.Clone(context.WithoutCancel(r.Context()))
+	br.Body = http.NoBody
+	ban := &Annotations{Route: an.Route, Pool: an.Pool, ClientIP: an.ClientIP, RequestID: an.RequestID, Trace: an.Trace, User: an.User}
+	brt := *rt
+	brt.Shadow = nil
+	bc := *c
+	bc.Stats = nil
+	go func() {
+		defer func() {
+			// abort ends a failed body this way; fill has released call.
+			if v := recover(); v != nil && v != http.ErrAbortHandler {
+				panic(v)
+			}
+		}()
+		h.fill(&backgroundWriter{h: http.Header{}}, br, &brt, &bc, ban,
+			fillOpts{primary: primary, stale: e, call: call, store: true, label: cacheMiss, background: true})
+	}()
+}
+
+// backgroundWriter is the ResponseWriter of a background fetch, which
+// answers nobody.
+type backgroundWriter struct{ h http.Header }
+
+func (w *backgroundWriter) Header() http.Header         { return w.h }
+func (w *backgroundWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *backgroundWriter) WriteHeader(int)             {}
 
 // fill fetches r from a backend, sends the response to the client and,
 // with o.store, stores it, buffering the body while it streams. With
@@ -181,18 +250,33 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 		// The waiters are released however this ends, a panic included.
 		defer o.call.Done(cache.Failed)
 	}
-	if !h.acquire(w, r, rt, an) {
+	if o.background {
+		// A background fetch must not queue ahead of clients. Without a
+		// slot it gives up, and a later request tries again.
+		if rt.Concurrency != nil && !rt.Concurrency.TryAcquire() {
+			return
+		}
+	} else if !h.acquire(w, r, rt, an) {
 		return
 	}
 	defer release(rt)
 
+	// gone ends once no client is waiting for this response: when r's
+	// client leaves, or, for a background fetch, when the headers arrive.
+	gone, headersIn := r.Context(), context.CancelFunc(func() {})
+	if o.background {
+		gone, headersIn = context.WithCancel(context.Background())
+		defer headersIn()
+	}
 	up, revalidating := r, false
 	if o.store || o.stale != nil {
 		ctx := r.Context()
 		if o.call != nil {
-			// The waiters depend on this fetch, so it goes on if this
-			// client leaves.
-			ctx = context.WithoutCancel(ctx)
+			// The waiters depend on this fetch, so it goes on without a
+			// client, but for lock_timeout at most.
+			var stop func()
+			ctx, stop = leaderContext(ctx, gone, c.LockTimeout)
+			defer stop()
 		}
 		up = r.Clone(ctx)
 		// The client's own conditionals are answered from the entry, not
@@ -213,8 +297,11 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 
 	requested := c.now()
 	f, fe := h.fetch(up, rt, an)
+	headersIn()
+	// A background fetch has nobody to serve the stale entry to.
+	fallback := o.stale != nil && !o.background
 	if fe != nil {
-		if now := c.now(); o.stale != nil && c.staleOK(o.stale, now) {
+		if now := c.now(); fallback && c.staleOK(o.stale, now) {
 			_, kind := classify(r.Context(), fe.err)
 			an.Error = string(kind)
 			h.logError(r, slog.LevelWarn, "upstream request failed, serving stale", an, fe.b, 0, kind, fe.err)
@@ -235,7 +322,7 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 
 	if e := o.stale; e != nil {
 		switch {
-		case resp.StatusCode >= 500 && c.staleOK(e, received):
+		case resp.StatusCode >= 500 && fallback && c.staleOK(e, received):
 			an.Error = string(kindUpstream)
 			h.logError(r, slog.LevelWarn, "upstream returned an error, serving stale", an, f.b, resp.StatusCode, kindUpstream,
 				fmt.Errorf("status %d", resp.StatusCode))
@@ -308,8 +395,14 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 		}
 		// The client left, but the waiters want the entry, so read the
 		// rest of the body for them.
-		if _, err := io.Copy(io.Discard, tee); err != nil && f.out == resilience.Success {
-			f.b.Overturn(f.adm)
+		if _, err := io.Copy(io.Discard, tee); err != nil {
+			if abandoned(resp) {
+				// A slow body is not a failed one, as it would not be with
+				// the client still there.
+				h.notStored(r, an, "drain_timeout")
+			} else if f.out == resilience.Success {
+				f.b.Overturn(f.adm)
+			}
 		}
 	}
 	if !tee.eof || tee.over {
@@ -325,6 +418,38 @@ func (h *Handler) fill(w http.ResponseWriter, r *http.Request, rt *Route, c *Cac
 	if o.call != nil {
 		o.call.Done(res)
 	}
+}
+
+// errDrainTimeout cancels a leader's fetch whose client left lock_timeout
+// ago.
+var errDrainTimeout = errors.New("cache fill abandoned after the client left")
+
+// leaderContext returns a context for a Flight leader's fetch, with
+// parent's values. It ends d after gone does: a backend that stalls
+// mid-body must not hold the leader's goroutine and concurrency slot for
+// good once nobody it answers is still connected. A waiter still waiting
+// then is released to fetch on its own, as at its own lock_timeout. stop
+// releases the context's resources.
+func leaderContext(parent, gone context.Context, d time.Duration) (ctx context.Context, stop func()) {
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
+	unhook := context.AfterFunc(gone, func() {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-t.C:
+			cancel(errDrainTimeout)
+		case <-ctx.Done():
+		}
+	})
+	return ctx, func() {
+		unhook()
+		cancel(nil)
+	}
+}
+
+// abandoned reports whether resp's body was cut off by errDrainTimeout.
+func abandoned(resp *http.Response) bool {
+	return resp.Request != nil && context.Cause(resp.Request.Context()) == errDrainTimeout
 }
 
 // authenticated reports whether r carried credentials, either an

@@ -41,6 +41,10 @@ type Admin struct {
 	// Pprof serves Go's profiler under /debug/pprof/ on the admin listener.
 	// A CPU profile or trace slows the process while it runs.
 	Pprof bool `yaml:"pprof"`
+	// Auth requires credentials for every admin endpoint except /ready and
+	// /live, with the same basic and api_keys blocks as a route. It is
+	// required when Listen is not a loopback address.
+	Auth *Auth `yaml:"auth"`
 }
 
 type Shutdown struct {
@@ -188,6 +192,10 @@ type Auth struct {
 	// was let in: the user name, or the name of the key. Any copy of it the
 	// client sent is removed.
 	IdentityHeader string `yaml:"identity_header"`
+	// FailureLimit caps wrong credentials per client IP (per /64 for IPv6),
+	// with a burst of its count. A client over it gets 429 before any
+	// password is checked. "off" turns it off.
+	FailureLimit OptionalRate `yaml:"failure_limit"`
 }
 
 // BasicAuth maps user names to bcrypt hashes, such as those from
@@ -274,4 +282,8 @@ type Cache struct {
 	// when the backend fails. A response's stale-if-error is also capped by
 	// it, so 0 never serves stale entries.
 	StaleIfError time.Duration `yaml:"stale_if_error"`
+	// StaleWhileRevalidate caps how long past its freshness an entry may be
+	// served while one background request revalidates it. A response's
+	// stale-while-revalidate is also capped by it, so 0 turns it off.
+	StaleWhileRevalidate time.Duration `yaml:"stale_while_revalidate"`
 }

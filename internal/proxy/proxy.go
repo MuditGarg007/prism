@@ -156,12 +156,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// After the rate limit, so the limit also caps password guessing and
-	// the bcrypt work it costs.
+	// the bcrypt work it costs. The authenticator's own failure limit caps
+	// guessing on routes without one.
 	if a := rt.Auth; a != nil {
-		user, err := a.Check(r)
+		user, err := a.Check(r, an.ClientIP)
 		if err != nil {
 			if r.Context().Err() != nil {
 				h.fail(w, r, rt, nil, an, err) // the client left while waiting
+				return
+			}
+			if le, ok := errors.AsType[*security.LimitedError](err); ok {
+				reject(w, an, http.StatusTooManyRequests, kindAuthLimited, le.RetryAfter)
 				return
 			}
 			if c := a.Challenge(); c != "" {
@@ -434,8 +439,9 @@ func (h *Handler) write(w http.ResponseWriter, r *http.Request, rt *Route, an *A
 	}
 	if readErr != nil {
 		// The headers counted as a success, but the backend failed to send
-		// the body it promised.
-		if f.out == resilience.Success && r.Context().Err() == nil {
+		// the body it promised. A body the cache gave up waiting for, with
+		// nobody connected, was only slow.
+		if f.out == resilience.Success && r.Context().Err() == nil && !abandoned(resp) {
 			f.b.Overturn(f.adm)
 		}
 		h.abort(r, rt, f.b, an, readErr)

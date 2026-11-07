@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"log/slog"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -81,7 +82,8 @@ func (r *Reloader) reload() (*Runtime, error) {
 	swapCerts()
 	r.cur.Swap(next)
 	// Right after the swap, to keep the gap without health checks short.
-	// The health state is shared, so the old checkers running a moment
+	// The health state and check record are shared, so the new checkers
+	// keep the old ones' schedule, and the old ones running a moment
 	// longer does no harm.
 	next.Start()
 	old.Retire(next)
@@ -104,7 +106,7 @@ func keepRestartOnly(cur, next *config.Config, log *slog.Logger) {
 		warn("listeners")
 		next.Listeners = cur.Listeners
 	}
-	if (cur.Admin == nil) != (next.Admin == nil) || cur.Admin != nil && *cur.Admin != *next.Admin {
+	if !reflect.DeepEqual(cur.Admin, next.Admin) {
 		warn("admin")
 		next.Admin = cur.Admin
 	}

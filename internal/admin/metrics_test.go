@@ -17,7 +17,7 @@ import (
 
 // metricsRuntime builds a runtime with every kind of state the collector
 // reports: two backends with a breaker and outlier detection, a route with
-// a concurrency limit, and a caching route.
+// a concurrency limit, a rate limit and auth, and a caching route.
 func metricsRuntime(t *testing.T, m *observability.Metrics, backends ...string) *runtime.Runtime {
 	t.Helper()
 	var list []string
@@ -35,7 +35,8 @@ upstreams:
   dark: { backends: [{ url: "http://127.0.0.1:1" }] }
 routes:
   - { match: { path_prefix: /api/ }, upstream: web, max_concurrency: 8, queue_size: 4, queue_timeout: 1s,
-      shadow: { upstream: dark, max_concurrency: 3 } }
+      shadow: { upstream: dark, max_concurrency: 3 }, rate_limit: { per_ip: 10/s },
+      auth: { api_keys: { header: X-API-Key, keys: { ci: "sha256:9b346041bc9a49574eb2665b2ad2a0a3f9f9cce4e42f5d1f26deb8a256b5966a" } } } }
   - { match: { path_prefix: / }, upstream: web, cache: { enabled: true } }
 `, strings.Join(list, ", ")), "")
 	if err != nil {
@@ -89,6 +90,8 @@ func TestMetrics(t *testing.T) {
 		`prism_route_concurrency_limit{route="/api/"} 8`,
 		`prism_route_queue_depth{route="/api/"} 0`,
 		`prism_shadow_inflight{route="/api/"} 1`,
+		`prism_ratelimit_evictions_total{limit="rate_limit",route="/api/"} 0`,
+		`prism_ratelimit_evictions_total{limit="auth_failures",route="/api/"} 0`,
 		`prism_cache_requests_total{result="MISS"} 1`,
 		`prism_cache_requests_total{result="HIT"} 1`,
 		`prism_cache_entries 1`,
@@ -105,9 +108,15 @@ func TestMetrics(t *testing.T) {
 	if !strings.Contains(out, "\ngo_goroutines ") {
 		t.Error("/metrics lacks the Go runtime's metrics")
 	}
-	// Only routes with a concurrency limit have its gauges.
-	if strings.Contains(out, `prism_route_concurrency_limit{route="/"}`) {
-		t.Error(`/metrics has a concurrency limit for route "/", which has none`)
+	// Only routes with a concurrency limit, or a limiter, have its series.
+	for _, series := range []string{
+		`prism_route_concurrency_limit{route="/"}`,
+		`prism_ratelimit_evictions_total{limit="rate_limit",route="/"}`,
+		`prism_ratelimit_evictions_total{limit="auth_failures",route="/"}`,
+	} {
+		if strings.Contains(out, series) {
+			t.Errorf(`/metrics has %s, but route "/" has none`, series)
+		}
 	}
 
 	problems, err := testutil.GatherAndLint(m.Registry)

@@ -33,6 +33,7 @@ const (
 	kindClientBody   errorKind = "client_body"
 	kindForbidden    errorKind = "forbidden"
 	kindUnauthorized errorKind = "unauthorized"
+	kindAuthLimited  errorKind = "auth_limited"
 	kindInternal     errorKind = "internal"
 )
 

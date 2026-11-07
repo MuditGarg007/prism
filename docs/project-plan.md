@@ -247,6 +247,57 @@ Build these together.
 - `BenchmarkPipeline` measures Prism's own cost per request without sockets, and `admin: {pprof: true}` serves the profiler for the real binary. Three allocation fixes from the profiles (empty date headers, the forwarding headers sharing one array, the traceparent formatted once) cut allocations per request from 26 to 21 (bare), 27 to 22 (full) and 13 to 9 (cache hit), per `benchstat`.
 - The README has the architecture diagrams, design decisions and tradeoffs, the benchmark table, the chaos graphs, the test strategy and a "what's not supported" section.
 
+### M8: Hardening, closing the gaps (1–1.5 weeks)
+
+M8 closes the gaps that M4–M7 left open: the security holes, the cache's known limits, the health-check behaviour across reloads, and Prism's latency tail. It is planned from the open items in `docs/m4-handoff.md` to `docs/m7-handoff.md`.
+
+**Decisions taken before M8.** The user took the recommended choice on each open decision (2026-10-22):
+
+- **Dependencies are confirmed:** `golang.org/x/crypto` (bcrypt), and vegeta and benchstat as `go tool`s. No other new libraries.
+- **The access log stays unbuffered by default.** A `-log-buffer <size>` flag (default 0, off) turns on a buffered writer that flushes when it is full, every second and at shutdown. This is opt-in, as nginx's `buffer=` is: with it on, a crash can lose up to a second of log lines, so whoever turns it on has accepted that.
+- **The WebSocket idle default stays at 5 minutes.** nginx's 60 s closes quiet sockets that send no application pings, and `websocket.idle_timeout` already changes it per route.
+- **`traceparent` is still accepted from any client.** It decides nothing in Prism, and joining traces that start in a browser or an app is the point of propagating it. Only `X-Request-Id` stays limited to trusted peers.
+
+**Scope:**
+
+- **Failed-auth limiter.** Every route with `auth` gets a per-client limit on failed credential checks: `auth.failure_limit`, a rate that defaults to `10/m` with a burst of 10, and that `off` disables. A request from a client over the limit gets 429 with `Retry-After` before any bcrypt work, so a password-guessing flood costs no CPU. Only failures count against the limit. IPv6 clients are keyed by their /64, so rotating addresses inside one allocation doesn't reset the count. A new `ratelimit.Limiter.Peek` checks the limit without spending from it. Failures and refusals get their own metrics, and Build no longer warns about a Basic auth route without a `rate_limit`.
+- **Admin authentication.** `admin.auth` takes the same `basic` and `api_keys` blocks as a route's auth, with the same authenticator and failed-auth limiter. A non-loopback `admin.listen` without `admin.auth` becomes a validation error (it was a warning), since `/config`, `/reload`, `/cache/purge` and pprof should never be open to the network. Prometheus scrapes with a bearer key.
+- **Readiness on the admin port.** The admin listener serves `GET /ready` (200 while serving, 503 once shutdown begins, the same state as `ready_path`) and `GET /live` (always 200). Both skip auth, because probes carry no credentials and the answers reveal nothing.
+- **Bounded cache drain.** Once the leader's client leaves, the leader reads the rest of the backend body for at most the route's `cache.lock_timeout`. It then gives up and stores nothing, which frees its goroutine and concurrency slot when a backend stalls mid-body.
+- **`stale-while-revalidate` (RFC 5861).** A new route setting, `cache.stale_while_revalidate`, mirrors `stale_if_error`: the route's value is the window, and a response's own directive can narrow it but not widen it. Within the window, a stale entry is served at once as `X-Cache: UPDATING`, and one background request per key, led through the existing `Flight`, revalidates it. The background request has a detached context, the route's concurrency slot and the upstream's timeouts. `must-revalidate`, `no-cache` and `s-maxage` forbid it, as they do stale-if-error. A new `updating` counter goes to `/cache/stats` and to the metrics.
+- **Health state survives reloads.** The check streak and the time of the last check move into each backend's shared state, which reloads already carry over. A new checker continues the streak and schedules its first check one interval after the last one, instead of at a fresh random offset. A reload storm then no longer delays marking a failing backend down.
+- **ip_hash spread.** Raise `pointsPerWeight` (within the `maxPoints` cap) until the distribution test shows about ±5% across 10 backends, down from about ±17%, and check the lookup benchmark. This remaps clients once, at the upgrade, and the upgrade notes say so. Add an e2e test of canary with `ip_hash` on both upstreams.
+- **Rate-limit key cap.** The cap stays, since it is what bounds memory under a flood. Evictions forced by a full shard are counted, in `prism_ratelimit_evictions_total`, so an operator can see when the cap is being hit.
+- **Latency tail.** Find the cause of Prism's 12–28 ms maximum latency. Under the bench load, take an execution trace from `/debug/pprof/trace` and run with `GODEBUG=gctrace=1`. If GC is confirmed, try cheap fixes (fewer allocations on the path the trace points at, or a `GOGC`/`GOMEMLIMIT` recommendation) and re-run the bench. The result goes into `docs/bench/` and the README, whether or not a fix lands. The same profile settles the per-request metric cost item from M5.
+- **`go mod tidy`.** It breaks on the stray `/home/mudit/go/go.mod`. Moving that file is a change to the user's environment, so it waits for their OK. After that, run tidy so direct dependencies are marked properly.
+
+**Steps:**
+
+1. `-log-buffer` flag and the dependency housekeeping
+2. Failed-auth limiter (`ratelimit.Peek`, `security`, config, metrics)
+3. Admin auth and the non-loopback validation error
+4. Admin `/ready` and `/live`
+5. Bounded cache drain
+6. `stale-while-revalidate`
+7. Health state across reloads
+8. ip_hash spread, the canary with ip_hash e2e test, and rate-limit eviction metrics
+9. Latency tail investigation and bench re-run (AC power, `performance` governor, containers stopped, as in M7)
+10. Exit tests, README "what's not supported", this status, `docs/m8-handoff.md`, and `go mod tidy` once the user allows it
+
+**Out of scope.** These stay documented in the README rather than built: WebSockets over HTTP/2 (RFC 8441), a WebSocket close frame at shutdown (Prism does not parse frames), one span per attempt, the shadow's `body_skipped` trade-off, the canary hash ignoring the route (deliberate), coalesced SIGHUPs, and the "Later, if ever" list below.
+
+**Exit:** e2e tests show the following:
+
+- A burst of wrong passwords gets 429 after the limit, and bcrypt work stays flat.
+- The admin API refuses requests without credentials, and a non-loopback admin listener without auth fails `-validate`.
+- `/ready` flips to 503 at shutdown.
+- A stale entry within `stale_while_revalidate` is served at once, while exactly one background request reaches the backend.
+- A leader whose client left gives up on a stalled body after `lock_timeout`.
+- Under a reload every 0.25 s, a failing backend is still marked down after `unhealthy_after` checks.
+- The ip_hash spread is within ±5%.
+
+The README's "what's not supported" section lists only the out-of-scope items above, and the cause of the latency tail is written down with evidence.
+
 ### Later, if ever
 
 A disk cache, HTTP/3 via quic-go, adaptive concurrency limits, and ACME/autocert.

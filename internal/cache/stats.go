@@ -10,11 +10,12 @@ type Stats struct {
 	Stale       atomic.Uint64 // served past freshness because the backend failed
 	Revalidated atomic.Uint64 // a stale entry the backend confirmed with a 304
 	Bypass      atomic.Uint64 // the bypass header skipped the lookup
+	Updating    atomic.Uint64 // served stale while a background request revalidates
 }
 
 // StatsSnapshot is a copy of Stats at one moment.
 type StatsSnapshot struct {
-	Hit, Miss, Stale, Revalidated, Bypass uint64
+	Hit, Miss, Stale, Revalidated, Bypass, Updating uint64
 }
 
 // Snapshot reads each counter. They are read one at a time, so a snapshot
@@ -26,5 +27,6 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		Stale:       s.Stale.Load(),
 		Revalidated: s.Revalidated.Load(),
 		Bypass:      s.Bypass.Load(),
+		Updating:    s.Updating.Load(),
 	}
 }

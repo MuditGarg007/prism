@@ -1,7 +1,8 @@
 // Package admin serves the admin API: the routes, the live state of the
 // upstreams, the effective config, Prometheus metrics, config reloads, cache
-// statistics and purging, and optionally Go's profiler. It has no
-// authentication, so it belongs on a loopback listener.
+// statistics and purging, and optionally Go's profiler. With admin.auth
+// set, every request needs credentials; without it, config validation keeps
+// the listener on loopback.
 package admin
 
 import (
@@ -11,12 +12,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
+	"net/netip"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/MuditGarg007/prism/internal/observability"
 	"github.com/MuditGarg007/prism/internal/runtime"
+	"github.com/MuditGarg007/prism/internal/security"
 )
 
 // maxBody bounds a request body. A purge is a few hundred bytes.
@@ -29,16 +34,21 @@ type Handler struct {
 	reload func() error
 	log    *slog.Logger
 	mux    *http.ServeMux
+	auth   *security.Authenticator // nil without admin.auth
 }
 
 // New returns the admin API for cur. When m is set, GET /metrics serves its
 // registry, to which New adds the state of whichever Runtime is current. It
 // must be called at most once per m. When reload is set, POST /reload calls
 // it, as SIGHUP does. When the current config sets admin.pprof, Go's
-// profiler is served under /debug/pprof/; admin settings need a restart, so
+// profiler is served under /debug/pprof/, and when it sets admin.auth,
+// every request must carry credentials. Admin settings need a restart, so
 // the config at New is the one that counts.
 func New(cur *runtime.Current, m *observability.Metrics, reload func() error, log *slog.Logger) *Handler {
 	h := &Handler{cur: cur, reload: reload, log: log, mux: http.NewServeMux()}
+	if rt := cur.Load(); rt != nil && rt.Config != nil && rt.Config.Admin != nil && rt.Config.Admin.Auth != nil {
+		h.auth = runtime.NewAuthenticator(rt.Config.Admin.Auth)
+	}
 	h.mux.HandleFunc("GET /routes", h.routes)
 	h.mux.HandleFunc("GET /upstreams", h.upstreams)
 	h.mux.HandleFunc("GET /config", h.config)
@@ -56,7 +66,7 @@ func New(cur *runtime.Current, m *observability.Metrics, reload func() error, lo
 		h.mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 	}
 	if m != nil {
-		m.Registry.MustRegister(collector{cur})
+		m.Registry.MustRegister(collector{cur: cur, admin: h.auth})
 		h.mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{
 			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 			// A broken collector loses its own series, not the scrape.
@@ -68,7 +78,36 @@ func New(cur *runtime.Current, m *observability.Metrics, reload func() error, lo
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	if h.auth != nil && !h.authorize(w, r) {
+		return
+	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// authorize checks r's credentials, and answers r and returns false when
+// they do not let it in. The admin listener is reached directly, so the
+// client is the peer; X-Forwarded-For is not trusted here.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) bool {
+	peer, _ := netip.ParseAddrPort(r.RemoteAddr)
+	client := peer.Addr()
+	_, err := h.auth.Check(r, client)
+	switch {
+	case err == nil:
+		return true
+	case r.Context().Err() != nil:
+		return false // the client left while waiting for a bcrypt slot
+	}
+	if le, ok := errors.AsType[*security.LimitedError](err); ok {
+		w.Header().Set("Retry-After", strconv.FormatInt(int64((le.RetryAfter+time.Second-1)/time.Second), 10))
+		writeError(w, http.StatusTooManyRequests, "too many failed logins")
+		return false
+	}
+	h.log.Info("admin request refused", "client", client, "method", r.Method, "path", r.URL.Path)
+	if c := h.auth.Challenge(); c != "" {
+		w.Header().Set("WWW-Authenticate", c)
+	}
+	writeError(w, http.StatusUnauthorized, "unauthorized")
+	return false
 }
 
 // ReloadResponse is the body of a successful POST /reload. A failed one
@@ -99,6 +138,7 @@ type CacheStats struct {
 	Stale       uint64 `json:"stale"`
 	Revalidated uint64 `json:"revalidated"`
 	Bypass      uint64 `json:"bypass"`
+	Updating    uint64 `json:"updating"`
 }
 
 func (h *Handler) cacheStats(w http.ResponseWriter, r *http.Request) {
@@ -118,6 +158,7 @@ func (h *Handler) cacheStats(w http.ResponseWriter, r *http.Request) {
 		Stale:       n.Stale,
 		Revalidated: n.Revalidated,
 		Bypass:      n.Bypass,
+		Updating:    n.Updating,
 	})
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/MuditGarg007/prism/internal/security"
 	"golang.org/x/crypto/bcrypt"
@@ -140,6 +141,44 @@ func TestProxyAuth(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestProxyAuthFailureLimit checks that a client over its failure limit,
+// told apart by its forwarded IP rather than the proxy in front, gets 429
+// with Retry-After even with the right password.
+func TestProxyAuthFailureLimit(t *testing.T) {
+	backend, hits := countingBackend(t)
+	hash, err := bcrypt.GenerateFromPassword([]byte("s3cret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := security.NewAuthenticator(security.AuthConfig{
+		Users:        map[string]string{"alice": string(hash)},
+		FailureCount: 2,
+		FailurePer:   time.Minute,
+	})
+	h := newHandler(t, testUpstream(backend.URL), &Route{Auth: a}, slog.New(slog.DiscardHandler), netip.MustParsePrefix("127.0.0.1/32"))
+	wrong := http.Header{"Authorization": {basicAuth("alice", "nope")}}
+	right := http.Header{"Authorization": {basicAuth("alice", "s3cret")}}
+
+	for range 2 {
+		if w := sendFrom(h, "198.51.100.1", "/", wrong); w.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong password: got %d, want 401", w.Code)
+		}
+	}
+	w := sendFrom(h, "198.51.100.1", "/", right)
+	if w.Code != http.StatusTooManyRequests || w.an.Error != "auth_limited" {
+		t.Errorf("after 2 failures: got %d, error %q; want 429 auth_limited", w.Code, w.an.Error)
+	}
+	if got := w.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After = %q, want 30", got)
+	}
+	if w := sendFrom(h, "198.51.100.2", "/", right); w.Code != http.StatusOK {
+		t.Errorf("another client behind the same proxy: got %d, want 200", w.Code)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("backend got %d requests, want 1", n)
 	}
 }
 

@@ -20,6 +20,7 @@
 #   bench/run.sh                         # about 25 minutes
 #   QUICK=1 bench/run.sh                 # one short run of each, to try it
 #   SCENARIOS="direct prism-bare" bench/run.sh
+#   PRISM_ENV="GOGC=400" OUT=bin/bench-gogc400 SCENARIOS="direct prism-bare" bench/run.sh
 #
 # nginx runs in Docker (NGINX_IMAGE) with host networking.
 set -euo pipefail
@@ -39,6 +40,7 @@ PROXY_CPUS=${PROXY_CPUS:-4-7}
 BACKEND_CPUS=${BACKEND_CPUS:-8-11}
 PROXY_THREADS=${PROXY_THREADS:-4}
 NGINX_IMAGE=${NGINX_IMAGE:-nginx:1.28.0-alpine}
+PRISM_ENV=${PRISM_ENV:-} # extra environment for Prism, such as GOGC=400
 if [[ ${QUICK:-} == 1 ]]; then
 	RATES=${QUICK_RATES:-2000} DURATION=3s WARMUP=1s REPEATS=1 MAX_DURATION=3s
 fi
@@ -79,7 +81,8 @@ start_backends() {
 }
 
 start_prism() {
-	taskset -c "$PROXY_CPUS" env GOMAXPROCS="$PROXY_THREADS" "$OUT/prism" \
+	# shellcheck disable=SC2086 # PRISM_ENV is a list of assignments
+	taskset -c "$PROXY_CPUS" env GOMAXPROCS="$PROXY_THREADS" $PRISM_ENV "$OUT/prism" \
 		-config "$ROOT/bench/$1.yaml" -log-format json 2>>"$OUT/logs/prism.log" &
 	PIDS[prism]=$!
 	PROXY_PID=$!
@@ -187,6 +190,7 @@ fi
 	echo "cpus: load $LOAD_CPUS, proxy $PROXY_CPUS ($PROXY_THREADS threads), backends $BACKEND_CPUS"
 	echo "runs: $REPEATS x $DURATION at $RATES req/s, $REPEATS x $MAX_DURATION closed loop with $MAX_WORKERS workers"
 	echo "body: $BODY_SIZE bytes"
+	if [[ -n $PRISM_ENV ]]; then echo "prism env: $PRISM_ENV"; fi
 } >"$OUT/env.txt"
 cat "$OUT/env.txt"
 

@@ -5,6 +5,7 @@ import (
 
 	"github.com/MuditGarg007/prism/internal/resilience"
 	"github.com/MuditGarg007/prism/internal/runtime"
+	"github.com/MuditGarg007/prism/internal/security"
 )
 
 // collector reports the state of the current Runtime when Prometheus
@@ -13,7 +14,8 @@ import (
 // request path, and means a reload needs no metric bookkeeping: the next
 // scrape simply reads the new Runtime.
 type collector struct {
-	cur *runtime.Current
+	cur   *runtime.Current
+	admin *security.Authenticator // the admin API's own; nil without admin.auth
 }
 
 func desc(name, help string, labels ...string) *prometheus.Desc {
@@ -33,6 +35,12 @@ var (
 	routeLimit     = desc("prism_route_concurrency_limit", "The route's max_concurrency.", "route")
 	routeQueue     = desc("prism_route_queue_depth", "Requests waiting for a concurrency slot.", "route")
 	shadowInFlight = desc("prism_shadow_inflight", "Shadow copies being sent, for routes with a shadow.", "route")
+	// A limiter replaced by a reload starts again from 0, which Prometheus
+	// reads as a counter reset. The admin API's limiter has route "admin",
+	// which no route can have, since route names contain a "/".
+	limiterEvictions = desc("prism_ratelimit_evictions_total",
+		"Clients forgotten by a full per-client limiter before they were idle, each getting a fresh burst. "+
+			"limit is rate_limit or auth_failures.", "route", "limit")
 
 	cacheRequests  = desc("prism_cache_requests_total", "Requests on caching routes, by X-Cache result.", "result")
 	cacheEntries   = desc("prism_cache_entries", "Responses held by the cache.")
@@ -81,6 +89,19 @@ func (c collector) Collect(ch chan<- prometheus.Metric) {
 		if sh := r.Shadow; sh != nil {
 			gauge(shadowInFlight, float64(sh.Slots.InUse()), r.Name)
 		}
+		if l := r.RateLimit; l != nil {
+			counter(limiterEvictions, l.Evictions(), r.Name, "rate_limit")
+		}
+		if a := r.Auth; a != nil {
+			if n, ok := a.FailureEvictions(); ok {
+				counter(limiterEvictions, n, r.Name, "auth_failures")
+			}
+		}
+	}
+	if c.admin != nil {
+		if n, ok := c.admin.FailureEvictions(); ok {
+			counter(limiterEvictions, n, "admin", "auth_failures")
+		}
 	}
 
 	if cc := rt.Cache; cc != nil {
@@ -90,6 +111,7 @@ func (c collector) Collect(ch chan<- prometheus.Metric) {
 		counter(cacheRequests, n.Stale, "STALE")
 		counter(cacheRequests, n.Revalidated, "REVALIDATED")
 		counter(cacheRequests, n.Bypass, "BYPASS")
+		counter(cacheRequests, n.Updating, "UPDATING")
 		gauge(cacheEntries, float64(st.Entries))
 		gauge(cacheBytes, float64(st.Bytes))
 		gauge(cacheMaxBytes, float64(cc.MaxSize))

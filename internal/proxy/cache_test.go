@@ -469,6 +469,72 @@ func TestCacheLeaderClientLeaves(t *testing.T) {
 	env.check(t, <-waiter, 200, "HIT", "helloworld", 1)
 }
 
+// TestCacheLeaderDrainTimeout checks that a leader whose client left gives
+// up on a stalled body after lock_timeout, stores nothing, and frees its
+// concurrency slot.
+func TestCacheLeaderDrainTimeout(t *testing.T) {
+	stalled := make(chan struct{})
+	canceled := make(chan struct{})
+	rt := &Route{Concurrency: limits.NewSemaphore(1, 0)}
+	env := newCacheEnv(t, rt, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		if r.URL.Path != "/stall" {
+			io.WriteString(w, "x")
+			return
+		}
+		w.Header().Set("Content-Length", "10")
+		io.WriteString(w, "hello")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-stalled:
+		}
+	})
+	env.c.LockTimeout = 50 * time.Millisecond
+	front := serve(t, env.h)
+	t.Cleanup(func() { close(stalled) }) // before either server's Close
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, "GET", front+"/stall", nil)
+	req.Host = "example.com"
+	go func() {
+		// The 5 bytes sent so far may sit in Prism's write buffer, so the
+		// client need not have the headers yet.
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	for env.hits.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	left := time.Now()
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the leader kept reading the stalled body")
+	}
+	if d := time.Since(left); d < env.c.LockTimeout {
+		t.Errorf("the leader gave up after %v, before lock_timeout", d)
+	}
+	// The slot is released once fill returns, just after the backend sees
+	// the cancellation.
+	deadline := time.Now().Add(10 * time.Second)
+	for rt.Concurrency.InUse() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the leader kept its concurrency slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	env.check(t, env.do("GET", "/other"), 200, "MISS", "x", 2)
+	if n := env.c.Store.Stats().Entries; n != 1 {
+		t.Errorf("%d entries, want 1 (only /other)", n)
+	}
+	if env.c.Flight.Waiting() != 0 {
+		t.Error("requests still waiting")
+	}
+}
+
 // TestCacheHitsSkipConcurrencyLimit checks that a hit is served while every
 // concurrency slot is taken, since hits put no load on a backend.
 func TestCacheHitsSkipConcurrencyLimit(t *testing.T) {
@@ -682,6 +748,213 @@ func TestCacheStaleWaiters(t *testing.T) {
 	}
 	if env.hits.Load() != 2 {
 		t.Errorf("backend saw %d requests, want 2", env.hits.Load())
+	}
+}
+
+// entry returns the entry stored for GET http://example.com/ and whether
+// there is one, without serving a request.
+func (env *cacheEnv) entry() (*cache.Entry, bool) {
+	_, e, ok := env.c.Store.Lookup(cache.PrimaryKey(httptest.NewRequest("GET", "http://example.com/", nil)), http.Header{})
+	return e, ok
+}
+
+// until polls until cond holds, failing t with what after 10 seconds.
+func until(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !cond(); {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCacheStaleWhileRevalidate(t *testing.T) {
+	tests := []struct {
+		name   string
+		cc     string
+		window time.Duration
+		after  time.Duration // past freshness
+		update bool
+	}{
+		{"within the route's window", "max-age=10", time.Minute, 30 * time.Second, true},
+		{"past the route's window", "max-age=10", time.Minute, 2 * time.Minute, false},
+		{"route window off", "max-age=10", 0, time.Second, false},
+		{"narrowed by the response", "max-age=10, stale-while-revalidate=5", time.Minute, 30 * time.Second, false},
+		{"within the response's window", "max-age=10, stale-while-revalidate=60", time.Minute, 30 * time.Second, true},
+		{"not widened by the response", "max-age=10, stale-while-revalidate=600", time.Minute, 2 * time.Minute, false},
+		{"must-revalidate", "max-age=10, must-revalidate", time.Minute, time.Second, false},
+		{"no-cache", "max-age=10, no-cache", time.Minute, time.Second, false},
+		{"s-maxage", "s-maxage=10", time.Minute, time.Second, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var version atomic.Int64
+			env := newCacheEnv(t, nil, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Cache-Control", tt.cc)
+				fmt.Fprintf(w, "v%d", version.Load())
+			})
+			env.c.StaleWhileRevalidate = tt.window
+			env.do("GET", "/")
+			version.Store(1)
+			env.clock.advance(10*time.Second + tt.after)
+			w := env.do("GET", "/")
+			if !tt.update {
+				env.check(t, w, 200, "MISS", "v1", 2)
+				return
+			}
+			if w.Code != 200 || w.Header().Get("X-Cache") != "UPDATING" || w.Body.String() != "v0" || w.an.Cache != "UPDATING" {
+				t.Fatalf("got %d, X-Cache %q, body %q; want 200, UPDATING, v0", w.Code, w.Header().Get("X-Cache"), w.Body.String())
+			}
+			if age := w.Header().Get("Age"); age != fmt.Sprint(int((10*time.Second+tt.after)/time.Second)) {
+				t.Errorf("Age %q", age)
+			}
+			until(t, "the background revalidation stored nothing", func() bool {
+				e, ok := env.entry()
+				return ok && string(e.Body) == "v1"
+			})
+			env.check(t, env.do("GET", "/"), 200, "HIT", "v1", 2)
+			// Only the client's answers are counted, not the background
+			// fetch's own.
+			if s := env.c.Stats.Snapshot(); s != (cache.StatsSnapshot{Miss: 1, Updating: 1, Hit: 1}) {
+				t.Errorf("stats %+v", s)
+			}
+		})
+	}
+}
+
+// TestCacheStaleWhileRevalidateOnce checks that concurrent requests for a
+// stale entry are all answered at once while exactly one background request
+// revalidates it.
+func TestCacheStaleWhileRevalidateOnce(t *testing.T) {
+	const n = 100
+	var notModified atomic.Int64
+	open := make(chan struct{})
+	var stale atomic.Bool
+	env := newCacheEnv(t, nil, func(w http.ResponseWriter, r *http.Request) {
+		if stale.Load() {
+			<-open
+		}
+		validating("hello", &notModified)(w, r)
+	})
+	env.c.StaleWhileRevalidate = time.Minute
+	env.do("GET", "/")
+	stale.Store(true)
+	env.clock.advance(15 * time.Second)
+	for _, w := range env.parallel(n, "/") {
+		if w.Code != 200 || w.Header().Get("X-Cache") != "UPDATING" || w.Body.String() != "hello" {
+			t.Fatalf("got %d, X-Cache %q, body %q", w.Code, w.Header().Get("X-Cache"), w.Body.String())
+		}
+	}
+	if env.c.Flight.Waiting() != 0 {
+		t.Error("requests waited for the revalidation")
+	}
+	close(open)
+	until(t, "the background revalidation did not finish", func() bool {
+		e, ok := env.entry()
+		return ok && e.Freshness.Fresh(env.clock.now())
+	})
+	env.check(t, env.do("GET", "/"), 200, "HIT", "hello", 2)
+	if notModified.Load() != 1 {
+		t.Errorf("backend sent %d 304s, want 1", notModified.Load())
+	}
+	if s := env.c.Stats.Snapshot(); s.Updating != n || s.Revalidated != 0 {
+		t.Errorf("stats %+v, want %d updating and no revalidated", s, n)
+	}
+}
+
+// TestCacheStaleWhileRevalidateFails checks that a background revalidation
+// that fails keeps the stale entry, releases the key so a later request
+// tries again, and that a body that stalls is given up on after
+// lock_timeout.
+func TestCacheStaleWhileRevalidateFails(t *testing.T) {
+	tests := []struct {
+		name string
+		fail func(w http.ResponseWriter, r *http.Request)
+	}{
+		{"5xx", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}},
+		{"body cut off", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "max-age=10")
+			w.Header().Set("Content-Length", "10")
+			io.WriteString(w, "hello")
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		}},
+		{"body stalls", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "max-age=10")
+			w.Header().Set("Content-Length", "10")
+			io.WriteString(w, "hello")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var failing atomic.Bool
+			env := newCacheEnv(t, nil, func(w http.ResponseWriter, r *http.Request) {
+				if failing.Load() {
+					tt.fail(w, r)
+					return
+				}
+				fixed("max-age=10", "hello")(w, r)
+			})
+			env.c.StaleWhileRevalidate = time.Minute
+			env.c.LockTimeout = 20 * time.Millisecond
+			env.do("GET", "/")
+			failing.Store(true)
+			env.clock.advance(15 * time.Second)
+			// Each request is answered stale, and once the failed fetch has
+			// let go of the key, another one starts.
+			until(t, "no second background revalidation", func() bool {
+				w := env.do("GET", "/")
+				if w.Header().Get("X-Cache") != "UPDATING" || w.Body.String() != "hello" {
+					t.Fatalf("got X-Cache %q, body %q", w.Header().Get("X-Cache"), w.Body.String())
+				}
+				return env.hits.Load() >= 3
+			})
+			if n := env.c.Store.Stats().Entries; n != 1 {
+				t.Errorf("%d entries, want the stale one", n)
+			}
+		})
+	}
+}
+
+// TestCacheStaleWhileRevalidateNoSlot checks that a background
+// revalidation does not queue for a concurrency slot: with none free it
+// gives up, and the stale entry is still served.
+func TestCacheStaleWhileRevalidateNoSlot(t *testing.T) {
+	open := make(chan struct{})
+	rt := &Route{Concurrency: limits.NewSemaphore(1, 10), QueueTimeout: time.Minute}
+	env := newCacheEnv(t, rt, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			<-open
+		}
+		fixed("max-age=10", "x")(w, r)
+	})
+	env.c.StaleWhileRevalidate = time.Minute
+	env.do("GET", "/")
+	env.clock.advance(15 * time.Second)
+	slow := make(chan *annotatedRecorder)
+	go func() { slow <- env.do("GET", "/slow") }()
+	until(t, "the slow request never reached the backend", func() bool { return env.hits.Load() == 2 })
+	if w := env.do("GET", "/"); w.Header().Get("X-Cache") != "UPDATING" {
+		t.Fatalf("X-Cache %q, want UPDATING", w.Header().Get("X-Cache"))
+	}
+	close(open)
+	<-slow
+	// A fetch that had queued would take the freed slot now. One that gave
+	// up leaves the backend alone until the next request.
+	time.Sleep(50 * time.Millisecond)
+	if env.hits.Load() != 2 {
+		t.Fatal("the background revalidation queued for a slot")
+	}
+	until(t, "the stale entry was never revalidated", func() bool {
+		return env.do("GET", "/").Header().Get("X-Cache") == "HIT"
+	})
+	if env.hits.Load() != 3 {
+		t.Errorf("backend saw %d requests, want 3", env.hits.Load())
 	}
 }
 

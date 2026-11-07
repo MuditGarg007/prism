@@ -4,13 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/MuditGarg007/prism/internal/ratelimit"
 )
 
 // AuthConfig is what an Authenticator checks. Users map names to bcrypt
@@ -27,6 +31,10 @@ type AuthConfig struct {
 	// IdentityHeader, when set, is removed from every request and then set
 	// to the name of the user or key that was let in.
 	IdentityHeader string
+	// FailureCount wrong credentials per FailurePer are allowed per client,
+	// with a burst of FailureCount. Zero turns the limit off.
+	FailureCount int
+	FailurePer   time.Duration
 }
 
 // Tuning for the cache of verified passwords.
@@ -38,6 +46,19 @@ const (
 // ErrUnauthorized is returned for missing or wrong credentials.
 var ErrUnauthorized = errors.New("unauthorized")
 
+// errWrong is ErrUnauthorized for credentials that were given but did not
+// match, which count against the failure limit. Missing credentials do
+// not: a browser's first request carries none.
+var errWrong = fmt.Errorf("wrong credentials: %w", ErrUnauthorized)
+
+// LimitedError is returned, before any credentials are checked, for a
+// client that has had too many wrong ones.
+type LimitedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *LimitedError) Error() string { return "too many failed logins" }
+
 // Authenticator checks the credentials of requests to one route. It is
 // safe for concurrent use, and a reload with unchanged auth settings keeps
 // it, along with its cache of verified passwords.
@@ -47,6 +68,11 @@ var ErrUnauthorized = errors.New("unauthorized")
 // keep that in check: a password that passed is remembered for verifiedTTL,
 // keyed by a SHA-256 of the user and password, and at most GOMAXPROCS
 // bcrypt checks run at once, the rest waiting their turn.
+//
+// A client that guesses gets FailureCount wrong tries per FailurePer, after
+// which it is refused before any work is done. The limit is checked again
+// once a bcrypt slot is free, so a client's queued guesses stop as soon as
+// the first ones have failed.
 type Authenticator struct {
 	cfg       AuthConfig
 	keyHeader string // canonical
@@ -54,6 +80,7 @@ type Authenticator struct {
 	cost      int    // bcrypt cost of the dummy hash for unknown users
 	cpu       chan struct{}
 	now       func() time.Time
+	failures  *ratelimit.Limiter // nil for no limit
 
 	mu       sync.Mutex
 	verified map[[sha256.Size]byte]verifiedEntry
@@ -84,6 +111,9 @@ func NewAuthenticator(c AuthConfig) *Authenticator {
 	if c.IdentityHeader != "" {
 		a.identity = http.CanonicalHeaderKey(c.IdentityHeader)
 	}
+	if c.FailureCount > 0 {
+		a.failures = ratelimit.New(c.FailureCount, c.FailurePer, c.FailureCount)
+	}
 	for _, h := range c.Users {
 		if n, err := bcrypt.Cost([]byte(h)); err == nil && n > a.cost {
 			a.cost = n
@@ -93,23 +123,61 @@ func NewAuthenticator(c AuthConfig) *Authenticator {
 }
 
 // Check returns the name of the user or key that r's credentials belong
-// to. It fails with ErrUnauthorized for missing or wrong credentials, or
-// with ctx's error if r's client leaves while waiting for a bcrypt slot.
-func (a *Authenticator) Check(r *http.Request) (string, error) {
+// to. client is r's client IP. Check fails with ErrUnauthorized for missing
+// or wrong credentials, with a *LimitedError for a client over the failure
+// limit, or with ctx's error if r's client leaves while waiting for a
+// bcrypt slot.
+func (a *Authenticator) Check(r *http.Request, client netip.Addr) (string, error) {
+	key := failureKey(client)
+	if err := a.limited(key); err != nil {
+		return "", err
+	}
+	name, err := a.check(r, key)
+	if errors.Is(err, errWrong) && a.failures != nil {
+		a.failures.Allow(key)
+	}
+	return name, err
+}
+
+func (a *Authenticator) check(r *http.Request, key netip.Addr) (string, error) {
 	if a.cfg.Keys != nil {
-		if key, ok := a.apiKey(r.Header); ok {
-			if name, ok := a.cfg.Keys[sha256.Sum256([]byte(key))]; ok {
+		if k, ok := a.apiKey(r.Header); ok {
+			if name, ok := a.cfg.Keys[sha256.Sum256([]byte(k))]; ok {
 				return name, nil
 			}
-			return "", ErrUnauthorized
+			return "", errWrong
 		}
 	}
 	if a.cfg.Users != nil {
 		if user, pass, ok := r.BasicAuth(); ok {
-			return a.checkPassword(r.Context(), user, pass)
+			return a.checkPassword(r.Context(), user, pass, key)
 		}
 	}
 	return "", ErrUnauthorized
+}
+
+// limited returns a *LimitedError if the client keyed by key is over the
+// failure limit.
+func (a *Authenticator) limited(key netip.Addr) error {
+	if a.failures == nil {
+		return nil
+	}
+	if ok, wait := a.failures.Peek(key); !ok {
+		return &LimitedError{RetryAfter: wait}
+	}
+	return nil
+}
+
+// failureKey is the key a client's failures count under. An IPv6 client
+// is keyed by its /64, the smallest block a site is usually given, so
+// cycling through addresses in it does not reset the count.
+func failureKey(client netip.Addr) netip.Addr {
+	client = client.Unmap()
+	if client.Is6() {
+		p, _ := client.Prefix(64)
+		return p.Addr()
+	}
+	return client
 }
 
 // apiKey returns the API key r carries, if it carries exactly one. Looking
@@ -131,7 +199,7 @@ func (a *Authenticator) apiKey(h http.Header) (string, bool) {
 	return v, v != ""
 }
 
-func (a *Authenticator) checkPassword(ctx context.Context, user, pass string) (string, error) {
+func (a *Authenticator) checkPassword(ctx context.Context, user, pass string, client netip.Addr) (string, error) {
 	hash, known := a.cfg.Users[user]
 	// The user is part of the key, so one user's password never lets in
 	// another, and a separator keeps "ab"+"c" apart from "a"+"bc".
@@ -146,14 +214,18 @@ func (a *Authenticator) checkPassword(ctx context.Context, user, pass string) (s
 		return "", ctx.Err()
 	}
 	defer func() { <-a.cpu }()
+	// Guesses that queued for a slot while earlier ones failed stop here.
+	if err := a.limited(client); err != nil {
+		return "", err
+	}
 	if !known {
 		// Spend as long as a real check, so the time taken does not tell
 		// which user names exist.
 		bcrypt.CompareHashAndPassword(dummyHash(a.cost), []byte(pass))
-		return "", ErrUnauthorized
+		return "", errWrong
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) != nil {
-		return "", ErrUnauthorized
+		return "", errWrong
 	}
 	a.remember(key, hash)
 	return user, nil
@@ -194,6 +266,16 @@ func (a *Authenticator) remember(key [sha256.Size]byte, hash string) {
 		}
 	}
 	a.verified[key] = verifiedEntry{hash: hash, expires: a.now().Add(verifiedTTL)}
+}
+
+// FailureEvictions returns the evictions from the failed-auth limiter (see
+// ratelimit.Limiter.Evictions), and false when the limit is off. Each one
+// forgot a client's recent failures.
+func (a *Authenticator) FailureEvictions() (uint64, bool) {
+	if a.failures == nil {
+		return 0, false
+	}
+	return a.failures.Evictions(), true
 }
 
 // Challenge returns the WWW-Authenticate value for a 401, or "" when the

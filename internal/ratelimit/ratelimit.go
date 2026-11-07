@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,9 @@ type Limiter struct {
 	seed     uint64
 	now      func() int64 // monotonic nanoseconds; swapped in tests
 	shards   [shards]shard
+	// evicted counts live keys dropped from a full shard. It is touched
+	// only when the cap is hit, so sharing it costs nothing otherwise.
+	evicted atomic.Uint64
 }
 
 type shard struct {
@@ -82,18 +86,43 @@ func (l *Limiter) Allow(key netip.Addr) (ok bool, retryAfter time.Duration) {
 	if wait := next - now - l.limit; wait > 0 {
 		return false, time.Duration(wait)
 	}
-	if !seen {
-		s.makeRoom(now)
+	if !seen && s.makeRoom(now) {
+		l.evicted.Add(1)
 	}
 	s.tat[k] = next
 	return true, 0
 }
 
+// Peek reports whether a request from key would be allowed now, and if
+// not, how long until one would be. Unlike Allow it spends nothing, so a
+// caller can check first and charge only for the requests that count, as
+// with Allow after a failed login.
+func (l *Limiter) Peek(key netip.Addr) (ok bool, retryAfter time.Duration) {
+	k := key.As16()
+	s := &l.shards[l.shardOf(k)]
+	now := l.now()
+
+	s.mu.Lock()
+	tat := s.tat[k]
+	s.mu.Unlock()
+	if wait := max(tat, now) + l.interval - now - l.limit; wait > 0 {
+		return false, time.Duration(wait)
+	}
+	return true, 0
+}
+
+// Evictions returns how many keys have been dropped from a full shard
+// before they were idle, each of which gave its client a fresh burst. A
+// rising count means the key cap is being hit, as in a flood of distinct
+// addresses.
+func (l *Limiter) Evictions() uint64 { return l.evicted.Load() }
+
 // makeRoom runs before a new key is added. Every sweepEvery inserts it drops
 // the keys whose TAT has passed. If the shard is full in between, it drops
 // an arbitrary key, which only gives that client a fresh burst; sweeping on
-// every insert of a full shard would cost a full scan per new client.
-func (s *shard) makeRoom(now int64) {
+// every insert of a full shard would cost a full scan per new client. It
+// reports whether it dropped a key that way.
+func (s *shard) makeRoom(now int64) (evicted bool) {
 	s.inserts++
 	if s.inserts >= sweepEvery {
 		s.inserts = 0
@@ -102,9 +131,10 @@ func (s *shard) makeRoom(now int64) {
 	if len(s.tat) >= shardCap {
 		for k := range s.tat {
 			delete(s.tat, k)
-			break
+			return true
 		}
 	}
+	return false
 }
 
 // sweep drops idle keys. Go maps never shrink, so when most keys are idle
