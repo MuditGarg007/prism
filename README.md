@@ -1,5 +1,7 @@
 # Prism
 
+New here? Start with the [docs](docs/README.md), which explain how a reverse proxy works from the ground up.
+
 Prism is an nginx-style HTTP reverse proxy written in Go. It uses `net/http` for the server and `http.Transport` for the client, and writes the rest by hand: the forwarding layer (hop-by-hop headers, forwarded headers, streaming, cancellation, error mapping, retries, WebSocket upgrades), the load balancers, the rate limiter, the circuit breaker, the response cache and its request coalescing. It does not use `httputil.ReverseProxy`. Libraries are used only for YAML, Prometheus and bcrypt.
 
 ## Features
@@ -139,8 +141,6 @@ flowchart LR
 
 ## Design decisions and tradeoffs
 
-The full reasoning is in the handoff notes, [`docs/m1-handoff.md`](docs/m1-handoff.md) through [`docs/m8-handoff.md`](docs/m8-handoff.md).
-
 **Forwarding**
 
 - **`net/http` and `http.Transport`, with no `httputil.ReverseProxy`.** Writing an HTTP parser would take months before any interesting feature, and wrapping `ReverseProxy` would leave the forwarding to the library. Prism owns everything between the two.
@@ -240,7 +240,7 @@ To reproduce, run `make bench-compare` (`QUICK=1` for a one-minute trial). It ne
 `make chaos` runs three [fault servers](test/faultserver) behind Prism at 300 req/s and draws each run with [`test/chaosplot`](test/chaosplot):
 
 - **[A backend killed and restarted](docs/m3-chaos/kill-backend.svg):** 12,001 requests with no errors. The breaker opened 0.4 s after the kill, health checks marked the backend down at 1.3 s, and after the restart half-open probes closed the breaker.
-- **[All backends returning 503 for 20 s](docs/m3-chaos/outage.svg):** with 2 retries per request, the retry budget held load amplification at 1.12 overall. Without the budget it would be 3.0.
+- **[All backends returning 503 for 20 s](docs/m3-chaos/outage.svg):** with 2 retries per request, the retry budget held load amplification to 1.23 during the outage, against 2.99 without it. Over the whole run, that is 1.12 against 2.00.
 
 ## Testing
 
@@ -261,8 +261,9 @@ To reproduce, run `make bench-compare` (`QUICK=1` for a one-minute trial). It ne
 - **A per-route canary split.** The canary hash ignores the route on purpose, so a client sees one version across routes.
 - **One reload per SIGHUP.** Signals sent during a reload are coalesced into one more reload, which reads the latest file anyway.
 - **Heuristic freshness, a disk cache, and caching HEAD misses.**
+- **Cache invalidation on POST, PUT or DELETE** (RFC 9111, section 4.4). An entry stays until it expires or `/cache/purge` removes it.
 - **ACME, adaptive concurrency limits and OpenTelemetry export.**
 
 ## Project history
 
-Prism was built in nine milestones, from a skeleton to these benchmarks and a final round of hardening. The plan and its status are in [`docs/project-plan.md`](docs/project-plan.md), and each milestone's decisions are in its handoff note in [`docs/`](docs/).
+Prism was built in nine milestones, from a skeleton to these benchmarks and a final round of hardening. The plan and its status are in [`docs/project-plan.md`](docs/project-plan.md).

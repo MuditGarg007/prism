@@ -1,0 +1,35 @@
+# A small config that runs on one machine, for docs/learn/03-run-it.md.
+# It expects three test backends on ports 9101, 9102 and 9103; that page
+# shows how to start them. For every setting Prism has, see prism.yaml here.
+
+listeners:
+  - addr: "127.0.0.1:8080"
+
+# Prism's own API for looking inside it. Never part of client traffic.
+admin: { listen: "127.0.0.1:9901" }
+
+upstreams:
+  # Two identical backends that share the traffic.
+  app:
+    balancer: round_robin
+    backends:
+      - { url: "http://127.0.0.1:9101" }
+      - { url: "http://127.0.0.1:9102" }
+    health: { path: /healthz, interval: 1s, timeout: 500ms, unhealthy_after: 2, healthy_after: 2 }
+
+  # One backend whose responses say they may be cached.
+  pages:
+    backends:
+      - { url: "http://127.0.0.1:9103" }
+
+routes:
+  # /api/users reaches a backend as /users.
+  - match: { path_prefix: "/api/" }
+    upstream: app
+    strip_prefix: true
+    rate_limit: { per_ip: "5/s", burst: 5 }
+    retry: { attempts: 1, on: [connect_error] }
+
+  - match: { path_prefix: "/pages/" }
+    upstream: pages
+    cache: { enabled: true }

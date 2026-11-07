@@ -190,7 +190,7 @@ Build these together.
 
 **Exit:** a coalescing test where 1,000 concurrent requests for a cold key produce exactly 1 upstream hit.
 
-**Status:** done on 2026-10-20. The decisions and details are in `docs/m4-handoff.md`. As built:
+**Status:** done on 2026-10-20. As built:
 
 - Every cached response carries `X-Cache`: `HIT`, `MISS`, `STALE`, `REVALIDATED` or `BYPASS`. The access log has the same value as `cache=`, and `GET /cache/stats` on the admin listener counts each one, along with the store's entries, bytes and evictions and the requests waiting on a fetch.
 - Coalescing follows nginx's `proxy_cache_lock`: one request fetches a cold or stale key and the rest wait up to `lock_timeout`, then fetch for themselves without storing. A response that can't be stored releases the waiters at once and marks the key **hit-for-pass** for 10 s, as Varnish does, so requests for an uncacheable URL never queue behind each other.
@@ -207,7 +207,7 @@ Build these together.
 
 **Exit:** a reload under load test with zero failed requests (run the load generator while reloading in a loop).
 
-**Status:** done on 2026-10-20. The decisions and details are in `docs/m5-handoff.md`. As built:
+**Status:** done on 2026-10-20. As built:
 
 - Metrics come from `prometheus/client_golang` on the admin listener's `GET /metrics`: requests by route, upstream and status class, request and per-attempt backend latency histograms, retries, budget refusals and proxy errors by kind, plus scrape-time gauges for backend inflight, health, ejection and breaker state, available backends, route concurrency and queue depth, the cache, and reload results. Handles are resolved when a config is built, so recording a request takes no label lookup and no allocation.
 - Every request carries `X-Request-Id`, kept from a trusted peer when well formed and generated otherwise. It goes to the backend and the client, and comes first in the access log.
@@ -223,7 +223,7 @@ Build these together.
 - WebSocket: detect `Upgrade`, hijack, run a bidirectional copy, and apply idle timeouts.
 - HTTP/2 comes for free on TLS listeners; h2c is optional. OpenTelemetry tracing (W3C `traceparent` propagation) is a bonus.
 
-**Status:** done on 2026-10-20. The decisions and details are in `docs/m6-handoff.md`. As built:
+**Status:** done on 2026-10-20. As built:
 
 - IP allow/deny lists at the top level (before routing) and per route, on the client IP after `trusted_proxies`. Refusals get 403.
 - Per-route auth: Basic with bcrypt hashes (a dummy hash for unknown users, verified passwords remembered for 5 minutes, bcrypt work capped at GOMAXPROCS), API keys looked up by SHA-256 digest, or either one. Checked credentials are stripped unless forwarded, and an optional identity header tells the backend who was let in. `GET /config` shows user and key names but no hashes. Build warns about a password route without a rate limit.
@@ -240,7 +240,7 @@ Build these together.
 - Profile the hot path and fix the top 2–3 allocation sources, such as header copying and buffer pooling.
 - Write a README with an architecture diagram, design decisions and their tradeoffs, and a "what's not supported" section.
 
-**Status:** done on 2026-10-21. The decisions and details are in `docs/m7-handoff.md`. As built:
+**Status:** done on 2026-10-21. As built:
 
 - `make bench-compare` (`bench/run.sh`) compares a direct backend, nginx 1.28 in Docker and Prism under vegeta, with CPU pinning, fresh processes and a warm-up per scenario, and the median of three runs at 5,000 and 20,000 req/s plus closed loop. `bench/report` writes `results.md` and a latency-by-percentile SVG. The checked-in results are in `docs/bench/`.
 - Results: Prism forwards about 70% of nginx's requests per second at about 2.4 times its CPU per request, adds 84 µs at the median at 5,000 req/s, and matches nginx on cache hits. Its maximum latency (13–28 ms) is well above nginx's.
@@ -249,7 +249,7 @@ Build these together.
 
 ### M8: Hardening, closing the gaps (1–1.5 weeks)
 
-M8 closes the gaps that M4–M7 left open: the security holes, the cache's known limits, the health-check behaviour across reloads, and Prism's latency tail. It is planned from the open items in `docs/m4-handoff.md` to `docs/m7-handoff.md`.
+M8 closes the gaps that M4–M7 left open: the security holes, the cache's known limits, the health-check behaviour across reloads, and Prism's latency tail.
 
 **Decisions taken before M8.** The user took the recommended choice on each open decision (2026-10-22):
 
@@ -282,7 +282,7 @@ M8 closes the gaps that M4–M7 left open: the security holes, the cache's known
 7. Health state across reloads
 8. ip_hash spread, the canary with ip_hash e2e test, and rate-limit eviction metrics
 9. Latency tail investigation and bench re-run (AC power, `performance` governor, containers stopped, as in M7)
-10. Exit tests, README "what's not supported", this status, `docs/m8-handoff.md`, and `go mod tidy` once the user allows it
+10. Exit tests, README "what's not supported", this status, and `go mod tidy` once the user allows it
 
 **Out of scope.** These stay documented in the README rather than built: WebSockets over HTTP/2 (RFC 8441), a WebSocket close frame at shutdown (Prism does not parse frames), one span per attempt, the shadow's `body_skipped` trade-off, the canary hash ignoring the route (deliberate), coalesced SIGHUPs, and the "Later, if ever" list below.
 
