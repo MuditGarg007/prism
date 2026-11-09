@@ -27,8 +27,8 @@ flowchart LR
 | --- | --- | --- |
 | `learn/` | building a mental model, start to finish | done |
 | `concepts/` | one subsystem at a time: the problem, the idea, Prism's code, an experiment, the tradeoffs | done |
-| `guides/` | adding a feature, testing, running Prism in production | planned |
-| `reference/` | every config key, admin endpoint, metric and status code | planned |
+| `guides/` | adding a feature, testing, running Prism in production | done |
+| `reference/` | every config key, admin endpoint, metric and status code | done |
 
 ## Concepts
 
@@ -48,9 +48,20 @@ Each page stands alone, and most include an experiment using [`scripts/lab-backe
 - [Observability](concepts/observability.md): logs, metrics, traces and profiling.
 - [Performance](concepts/performance.md): reading benchmarks, and the patterns on the hot path.
 
+## Guides
+
+- [Add a feature](guides/add-a-feature.md): a new load balancer, from the interface to the docs, with the mistakes along the way.
+- [Testing](guides/testing.md): unit, fuzz, end-to-end, chaos and benchmark tests, and when to run each.
+- [Operating Prism](guides/operating-prism.md): deploying, changing config safely, tuning, and what to alert on.
+
 ## Reference
 
-Until `reference/` exists, the commented [`examples/prism.yaml`](../examples/prism.yaml) lists every setting.
+- [Config](reference/config.md): every setting, its default and its rules, plus the command-line flags and signals.
+- [Admin API](reference/admin-api.md): every endpoint, with real requests and responses.
+- [Metrics](reference/metrics.md): every Prometheus metric and its labels.
+- [Status codes](reference/status-codes.md): the statuses Prism makes itself, the error kinds, and the headers it adds.
+
+The commented [`examples/prism.yaml`](../examples/prism.yaml) shows a full config in one file.
 
 ## Other documents
 

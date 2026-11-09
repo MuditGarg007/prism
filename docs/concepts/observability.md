@@ -83,7 +83,7 @@ Metrics are pre-aggregated: a counter is one number, however many requests it co
 | `prism_config_last_reload_successful` | gauge | an alert when a bad config was refused |
 | `prism_ratelimit_evictions_total{route,limit}` | counter | the limiter's key cap is being hit |
 
-There's also Go's own runtime and process metrics. `reference/` will have the complete list.
+There's also Go's own runtime and process metrics. The [metrics reference](../reference/metrics.md) has the complete list.
 
 Some useful Prometheus queries:
 
