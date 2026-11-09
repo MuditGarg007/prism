@@ -63,7 +63,4 @@ Each page stands alone, and most include an experiment using [`scripts/lab-backe
 
 The commented [`examples/prism.yaml`](../examples/prism.yaml) shows a full config in one file.
 
-## Other documents
-
-- [Benchmark results](bench/results.md) compare Prism with nginx.
-- [Project plan](project-plan.md) records how Prism was built, milestone by milestone. It is history: where it disagrees with the code, the code is right.
+The [benchmark results](bench/results.md) compare Prism with nginx, with every percentile and the exact setup.
