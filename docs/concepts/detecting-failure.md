@@ -242,4 +242,4 @@ flowchart LR
 4. A pool of 4 backends with `max_ejection_percent: 50`. Two are ejected, and a third reaches its failure count. What happens?
 5. Why does Prism need health checks at all, given the two passive detectors?
 
-This is the end of the core concepts so far. Back to the [docs index](../README.md).
+Next: [HTTP caching](http-caching.md).

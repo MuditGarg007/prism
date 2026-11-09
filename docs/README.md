@@ -26,7 +26,7 @@ flowchart LR
 | section | what it is for | status |
 | --- | --- | --- |
 | `learn/` | building a mental model, start to finish | done |
-| `concepts/` | one subsystem at a time: the problem, the idea, Prism's code, an experiment, the tradeoffs | in progress |
+| `concepts/` | one subsystem at a time: the problem, the idea, Prism's code, an experiment, the tradeoffs | done |
 | `guides/` | adding a feature, testing, running Prism in production | planned |
 | `reference/` | every config key, admin endpoint, metric and status code | planned |
 
@@ -40,8 +40,13 @@ Each page stands alone, and most include an experiment using [`scripts/lab-backe
 - [Rate limits and overload](concepts/rate-limits-and-overload.md): GCRA, concurrency limits and load shedding.
 - [Timeouts and retries](concepts/timeouts-and-retries.md): when to give up, and when trying again is safe.
 - [Detecting failure](concepts/detecting-failure.md): health checks, circuit breakers and outlier ejection.
-
-Coming next: caching, security, canary and shadow traffic, hot reload, observability and performance.
+- [HTTP caching](concepts/http-caching.md): what may be stored, for how long, and how to confirm it's still good.
+- [Inside the cache](concepts/inside-the-cache.md): stampedes, serving stale, and the store.
+- [Security](concepts/security.md): trust boundaries, passwords, API keys and the admin API.
+- [Canary, shadow and WebSockets](concepts/canary-shadow-websockets.md): shipping safely, and two-way connections.
+- [Hot reload and shutdown](concepts/hot-reload-and-shutdown.md): changing and stopping a live proxy.
+- [Observability](concepts/observability.md): logs, metrics, traces and profiling.
+- [Performance](concepts/performance.md): reading benchmarks, and the patterns on the hot path.
 
 ## Reference
 

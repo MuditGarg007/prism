@@ -1,0 +1,20 @@
+# For docs/concepts/observability.md and performance.md. Backends come from
+# scripts/lab-backends.sh, and /echo/ needs examples/labs/echo-backend.py.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+admin: { listen: "127.0.0.1:9901", pprof: true }
+
+upstreams:
+  app:
+    backends:
+      - { url: "http://127.0.0.1:9101" }
+      - { url: "http://127.0.0.1:9102" }
+  echo: { backends: [{ url: "http://127.0.0.1:9104" }] }
+
+routes:
+  - match: { path_prefix: "/app/" }
+    upstream: app
+  - match: { path_prefix: "/echo/" }
+    upstream: echo
+    strip_prefix: true

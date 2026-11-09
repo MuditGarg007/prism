@@ -1,0 +1,21 @@
+# For docs/concepts/hot-reload-and-shutdown.md. Backends come from
+# scripts/lab-backends.sh.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+admin: { listen: "127.0.0.1:9901" }
+
+ready_path: /readyz
+shutdown: { drain_delay: 3s, timeout: 10s }
+
+upstreams:
+  app:
+    backends:
+      - { url: "http://127.0.0.1:9101" }
+      - { url: "http://127.0.0.1:9102" }
+    health: { path: /healthz, interval: 1s, timeout: 500ms }
+
+routes:
+  - match: { path_prefix: "/app/" }
+    upstream: app
+    rate_limit: { per_ip: "1000/s", burst: 1000 }

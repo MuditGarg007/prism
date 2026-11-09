@@ -1,0 +1,26 @@
+# For docs/concepts/security.md. It needs examples/labs/echo-backend.py.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+upstreams:
+  echo: { backends: [{ url: "http://127.0.0.1:9104" }] }
+
+routes:
+  # The password of alice is s3cret, and the API key is key-one.
+  - match: { path_prefix: "/private/" }
+    upstream: echo
+    strip_prefix: true
+    auth:
+      basic:
+        realm: lab
+        users: { alice: "$2a$10$7PTiybTg/fasyyDtp5gxKO.dwkbXmCniNwUPJz/LHRnxoqhi4pe/6" }
+      api_keys:
+        header: X-API-Key
+        keys: { ci: "sha256:9b346041bc9a49574eb2665b2ad2a0a3f9f9cce4e42f5d1f26deb8a256b5966a" }
+      identity_header: X-Auth-User
+      failure_limit: 3/m
+
+  # Only clients in 10.0.0.0/8, which you are not.
+  - match: { path_prefix: "/internal/" }
+    upstream: echo
+    access: { allow: ["10.0.0.0/8"] }

@@ -1,0 +1,32 @@
+# For docs/concepts/canary-shadow-websockets.md. Backends come from
+# scripts/lab-backends.sh, and /ws/ needs examples/labs/ws-echo.py.
+listeners:
+  - addr: "127.0.0.1:8080"
+
+admin: { listen: "127.0.0.1:9901" }
+
+# So that curl can play many clients by sending X-Forwarded-For.
+trusted_proxies: ["127.0.0.1"]
+
+upstreams:
+  stable: { backends: [{ url: "http://127.0.0.1:9101" }] }
+  next: { backends: [{ url: "http://127.0.0.1:9102" }] }
+  mirror: { backends: [{ url: "http://127.0.0.1:9103" }] }
+  ws: { backends: [{ url: "http://127.0.0.1:9105" }] }
+
+routes:
+  - match: { path_prefix: "/canary/" }
+    upstream: stable
+    canary: { upstream: next, percent: 20, header: X-Canary }
+
+  - match: { path_prefix: "/shadow/" }
+    upstream: stable
+    shadow: { upstream: mirror, percent: 100 }
+
+  - match: { path_prefix: "/ws/" }
+    upstream: ws
+    websocket: { idle_timeout: 2s }
+
+  # No websocket block, so upgrades are refused.
+  - match: { path_prefix: "/plain/" }
+    upstream: stable
