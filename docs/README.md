@@ -23,12 +23,12 @@ flowchart LR
     B --> D[reference/<br/>looking something up]
 ```
 
-| section | what it is for | status |
-| --- | --- | --- |
-| `learn/` | building a mental model, start to finish | done |
-| `concepts/` | one subsystem at a time: the problem, the idea, Prism's code, an experiment, the tradeoffs | done |
-| `guides/` | adding a feature, testing, running Prism in production | done |
-| `reference/` | every config key, admin endpoint, metric and status code | done |
+| section | what it is for |
+| --- | --- |
+| `learn/` | building a mental model, start to finish |
+| `concepts/` | one subsystem at a time: the problem, the idea, Prism's code, an experiment, the tradeoffs |
+| `guides/` | adding a feature, testing, running Prism in production |
+| `reference/` | every config key, admin endpoint, metric and status code |
 
 ## Concepts
 
